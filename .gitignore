@@ -1,0 +1,30 @@
+# ---- Python / uv ----
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- 本地敏感凭证（绝不入库）----
+.yuque/
+auth.json
+*storage-state*.json
+yuque-state.json
+.env
+.env.*
+!.env.example
+
+# ---- Playwright ----
+.playwright-cli/
+*.playwright-profile/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

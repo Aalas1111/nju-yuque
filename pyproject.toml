@@ -1,0 +1,65 @@
+[project]
+name = "nju-yuque"
+version = "0.0.0"
+description = "语雀（Yuque）自动化 CLI + Skill — 让 agent 读知识库、读表格、发评论"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "NOVA Contributors" }]
+keywords = ["yuque", "语雀", "cli", "skill", "agent", "nju", "nova"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "httpx[socks]>=0.27",
+    "pydantic>=2.7",
+    "rich>=13.7",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+# 浏览器登录（抓 cookie）需要 Playwright；有系统 Edge/Chrome 时可免下载内核
+login = ["playwright>=1.44"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+yuque = "nju_yuque.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.28,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = [
+    "tests/**",
+    "scripts/**",
+    "docs/**",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008：typer/click 的推荐写法就是在默认值里调用 Option，无需规避
+ignore = ["E501", "B008"]
