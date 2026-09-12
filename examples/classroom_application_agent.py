@@ -24,7 +24,9 @@ agent 会自动生成提交所需的**借用节次**（由活动时间推算）�
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import pathlib
 import re
 import sys
 from collections.abc import Sequence
@@ -55,6 +57,15 @@ STATUS_PENDING = "待提交"
 STATUS_SUBMITTED = "已提交（待审核通过）"
 STATUS_APPROVED = "已通过（本文档已归档，禁止再次修改）"
 STATUS_REJECTED = "已退回（修改后请把状态改为待提交）"
+STATUS_WITHDRAWN = "已撤回（原申请已撤回，如需重新申请请新建文档）"
+
+# 学校办事大厅的审核状态 SHZT -> (人话, 要回写的语雀状态)  None 表示不变
+SHZT_MAP: dict[str, tuple[str, str | None]] = {
+    "00": ("草稿（未提交）", None),
+    "65": ("待审核", None),
+    "99": ("已通过", STATUS_APPROVED),
+    "1": ("已撤回", STATUS_WITHDRAWN),
+}
 STATUS_RE = re.compile(r"^([ \t>*\-•]*\**\s*状态\s*\**\s*[:：][ \t]*)(.*)$", re.MULTILINE)
 
 # ---------------------------------------------------------------- 业务规则
@@ -215,6 +226,14 @@ def normalize_campus(raw: str) -> tuple[str, str, str]:
             fix = "" if text == name else f"校区「{text}」→ {name}"
             return name, code, fix
     return "", "", ""
+
+
+def by_uuid_title(items: list, doc_id: int) -> str:
+    """按 doc_id 找目录里的标题（仅用于提示）。"""
+    for i in items:
+        if i.doc_id == doc_id:
+            return i.title
+    return f"#{doc_id}"
 
 
 def title_problem(title: str) -> str | None:
@@ -629,6 +648,128 @@ def plan(kb: Kb, guide_id: int | None = None) -> list[tuple[Doc, object, Verdict
     return out
 
 
+# ---------------------------------------------------------------- 审核结果同步
+SQBH_RE = re.compile(r"申请编号[：:]\s*([0-9a-zA-Z]{8,})")
+SHZT_RE = re.compile(r"学校状态[：:]\s*(?:SHZT=([0-9A-Za-z]+)|(查无此申请))")
+MISSING = "查无此申请"
+
+
+def read_log_facts(body: str) -> dict[str, str | None]:
+    """从审批日志正文里读出「申请编号」与「上次同步到的学校状态」。"""
+    sqbh = None
+    for m in SQBH_RE.finditer(body or ""):
+        sqbh = m.group(1)
+    shzt = None
+    for m in SHZT_RE.finditer(body or ""):
+        shzt = m.group(1) or MISSING
+    return {"sqbh": sqbh, "shzt": shzt}
+
+
+def fetch_crb_list(path: str | None, cmd: str) -> list[dict]:
+    """拿学校系统的申请列表（--crb-list 可直接读本地 JSON，方便离线测试）。"""
+    if path:
+        raw = pathlib.Path(path).read_text(encoding="utf-8")
+    else:
+        import subprocess
+
+        proc = subprocess.run(
+            [*cmd.split(), "borrow", "list", "--json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if proc.returncode != 0:
+            raise SystemExit(f"调用 crb 失败（{proc.returncode}）：{proc.stderr[:300]}")
+        raw = proc.stdout
+    data = json.loads(raw)
+    if isinstance(data, list):
+        return data
+    return list(data.get("rows") or [])
+
+
+def sync_status(kb: Kb, rows: list[dict], *, apply: bool) -> None:
+    """把学校系统的审核结果回写到语雀（归档区也允许，因为这是既有申请的后续状态）。"""
+    by_sqbh = {str(r.get("SQBH") or ""): r for r in rows if r.get("SQBH")}
+    items = kb.toc()
+    path = Kb.node_path(items)
+    doc_node = {i.doc_id: i for i in items if i.doc_id}
+    stamp = kb.now.strftime("%Y-%m-%d %H:%M")
+    touched = 0
+
+    for doc in kb.docs():
+        node = doc_node.get(doc.id)
+        if node is None:
+            continue
+        # 归档区不参与同步：归档就是终点，晚到的审核结果不再回写
+        if ARCHIVE_TITLE in path.get(node.uuid, []):
+            continue
+        log = kb.find_log(node.uuid)
+        if log is None:
+            continue
+        log_body = kb.read(log.id).body or ""
+        facts = read_log_facts(log_body)
+        sqbh, last_shzt = facts["sqbh"], facts["shzt"]
+
+        # 只关心「已提交待审」或「日志里已有申请编号」的文档；
+        # 已终态且没有编号的（比如归档区的历史样本）不参与同步
+        if not sqbh:
+            app_status = parse_fields(kb.read(doc.id).body or "").get("状态", "")
+            if app_status != STATUS_SUBMITTED:
+                continue
+
+        row = by_sqbh.get(sqbh) if sqbh else None
+        matched_by_title = False
+        if row is None and not sqbh:
+            cands = [r for r in rows if doc.title and doc.title in str(r.get("JYYTMS") or "")]
+            if len(cands) == 1:
+                row, matched_by_title = cands[0], True
+            elif len(cands) > 1:
+                print(f"  ! {doc.title}：标题匹配到 {len(cands)} 条申请，请人工确认，跳过")
+                continue
+
+        if row is None:
+            if last_shzt == MISSING:
+                continue
+            note = (
+                f"### {stamp} · 审核结果同步\n"
+                f"- 申请编号：{sqbh or '未知'}\n"
+                "- 学校状态：查无此申请\n"
+            )
+            print(f"  ? {doc.title}：列表里查不到对应申请（SQBH={sqbh or '无'}）")
+            if apply:
+                kb.api.update_doc(kb.repo, log.id, body=log_body + "\n" + note)
+            continue
+
+        real_sqbh = str(row.get("SQBH") or "")
+        shzt = str(row.get("SHZT") or "")
+        if shzt == last_shzt and not matched_by_title:
+            continue
+
+        text, new_status = SHZT_MAP.get(shzt, (f"未知状态 {shzt}", None))
+        lines = [
+            f"### {stamp} · 审核结果同步",
+            f"- 申请编号：{real_sqbh}",
+            f"- 学校状态：SHZT={shzt}（{text}）",
+        ]
+        if matched_by_title:
+            lines.append(f"- 说明：按标题「{doc.title}」匹配到该申请，已回填申请编号")
+        if new_status:
+            lines.append(f"- 处理：语雀文档状态 → {new_status}")
+        else:
+            lines.append("- 处理：状态暂不变更")
+        note = "\n".join(lines) + "\n"
+
+        print(f"  ⇄ {doc.title}：SHZT={shzt} {text} → {new_status or '（不变）'}")
+        if apply:
+            kb.api.update_doc(kb.repo, log.id, body=log_body + "\n" + note)
+            if new_status:
+                kb.set_status(doc, new_status)
+        touched += 1
+
+    if touched == 0:
+        print("  没有需要同步的申请")
+
+
 def approve_doc(kb: Kb, key: str) -> None:
     """把一份申请推进到「已通过」（学校审核通过后调用）。"""
     doc = next((d for d in kb.docs() if d.slug == key or d.title == key), None)
@@ -677,6 +818,13 @@ def main() -> None:
         "--guide", metavar="doc_id|slug", help="指导文档 id（首次可自动识别，之后锁定）"
     )
     ap.add_argument(
+        "--sync-status",
+        action="store_true",
+        help="同步学校审核结果到语雀（调 crb borrow list）",
+    )
+    ap.add_argument("--crb-list", metavar="文件", help="不调 crb，直接读本地 JSON（离线测试）")
+    ap.add_argument("--crb-cmd", default="crb", help="crb 命令，默认 crb")
+    ap.add_argument(
         "--approve",
         action="append",
         default=[],
@@ -691,6 +839,14 @@ def main() -> None:
             print(f"# KB={args.repo}  现在={kb.now:%Y-%m-%d %H:%M}")
             for key in args.approve:
                 approve_doc(kb, key)
+            return
+
+        if args.sync_status:
+            rows = fetch_crb_list(args.crb_list, args.crb_cmd)
+            print(f"# 学校系统申请 {len(rows)} 条  dry_run={not args.apply}\n")
+            sync_status(kb, rows, apply=args.apply)
+            if not args.apply:
+                print("（dry-run，未做任何修改；加 --apply 执行）")
             return
 
         items = kb.toc()
@@ -761,14 +917,31 @@ def main() -> None:
                 print(f"  ! {doc.title} 写日志失败：{exc}")
 
         if archive:  # 过期周目录归档
+            status_by_id = {
+                d.id: parse_fields(kb.read(d.id).body or "").get("状态", "") for d in kb.docs()
+            }
             for wd in [i for i in items if i.type == "TITLE" and WEEK_TITLE_RE.match(i.title)]:
                 m = WEEK_TITLE_RE.match(wd.title)
                 end = datetime.strptime(
                     f"{kb.now.year}-{m.group(3)}-{m.group(4)}", "%Y-%m-%d"
                 ).replace(tzinfo=CN, hour=23, minute=59)
-                if end < kb.now:
-                    kb.move(wd.uuid, archive.uuid)
-                    print(f"  📦 已归档：{wd.title}")
+                if end >= kb.now:
+                    continue
+                pending = [
+                    i
+                    for i in items
+                    if i.doc_id
+                    and i.parent_uuid == wd.uuid
+                    and status_by_id.get(i.doc_id) == STATUS_SUBMITTED
+                ]
+                if pending:
+                    names = "、".join(by_uuid_title(items, i.doc_id) for i in pending)
+                    print(
+                        f"  ⚠️ {wd.title} 还有 {len(pending)} 份未结案的申请（{names}）；"
+                        "归档后不再回写审核结果，建议先跑一次 --sync-status"
+                    )
+                kb.move(wd.uuid, archive.uuid)
+                print(f"  📦 已归档：{wd.title}")
         print("完成")
     finally:
         kb.close()

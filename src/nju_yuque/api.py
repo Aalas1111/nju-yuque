@@ -271,9 +271,13 @@ class YuqueApi:
         return [TocItem.model_validate(x) for x in (data or [])]
 
     def toc_move(self, repo: str, *, node_uuid: str, target_uuid: str) -> list[TocItem]:
-        """把已有目录节点移动到另一个父节点下（归档 / 纠正位置）。"""
+        """把已有目录节点移动到另一个父节点下（归档 / 纠正位置）。
+
+        实测：移动必须用 ``appendNode`` + ``node_uuid``；
+        ``editNode`` + ``target_uuid`` 会返回 200 但**不生效**（静默失败）。
+        """
         payload = {
-            "action": "editNode",
+            "action": "appendNode",
             "action_mode": "child",
             "node_uuid": node_uuid,
             "target_uuid": target_uuid,

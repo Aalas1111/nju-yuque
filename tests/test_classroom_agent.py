@@ -320,3 +320,119 @@ def test_archived_docs_are_never_touched_not_even_deleted() -> None:
     for _doc, _node, v in reports:
         assert v.action == "skip", v
         assert "已归档" in v.note
+
+
+# ---------------------------------------------------------------- 审核结果同步
+class _SyncKb(_FakeKb):
+    """带审批日志的假 Kb，用来离线验证 sync_status。"""
+
+    def __init__(self, items, docs, now, log_id) -> None:
+        super().__init__(items, docs, now)
+        self.log_id = log_id
+        self.repo = "fake/repo"
+        self.updated: list[tuple[int, str]] = []
+        self.statuses: list[tuple[int, str]] = []
+        self.api = self
+
+    def find_log(self, _uuid):
+        return next(d for d in self._docs if d.id == self.log_id)
+
+    def set_status(self, doc, status):
+        self.statuses.append((doc.id, status))
+
+    def update_doc(self, _repo, doc_id, body):
+        self.updated.append((doc_id, body))
+
+
+LOG_NO_SQBH = """> ⚙️ 本文件由系统自动维护，请勿手动编辑。
+
+### 2026-09-12 09:55 · 校验通过，已提交
+- 结论：**通过**
+- 处理：已提交教室申请，当前状态 已提交（待审核通过）
+"""
+
+
+def _sync_setup(log_body: str):
+    items = [
+        _toc("week", "TITLE", "0914-0920"),
+        _toc("n1", "DOC", "新生见面会", parent="week", doc_id=1, slug="s1"),
+    ]
+    docs = [
+        Doc(id=1, slug="s1", title="新生见面会", body="状态：已提交（待审核通过）"),
+        Doc(id=2, slug="log", title="审批日志", body=log_body),
+    ]
+    return _SyncKb(items, docs, NOW, log_id=2)
+
+
+def test_read_log_facts() -> None:
+    assert agent.read_log_facts(LOG_NO_SQBH) == {"sqbh": None, "shzt": None}
+    body = LOG_NO_SQBH + "\n- 申请编号：abcdef1234567890\n- 学校状态：SHZT=65（待审核）\n"
+    assert agent.read_log_facts(body) == {"sqbh": "abcdef1234567890", "shzt": "65"}
+    assert agent.read_log_facts("学校状态：查无此申请")["shzt"] == agent.MISSING
+
+
+def test_sync_matches_by_title_and_records_sqbh() -> None:
+    kb = _sync_setup(LOG_NO_SQBH)
+    rows = [{"SQBH": "abcdef1234567890", "SHZT": "99", "JYYTMS": "新生见面会（意向：仙Ⅰ-306）"}]
+    agent.sync_status(kb, rows, apply=True)
+    # 日志里要回填申请编号 + 学校状态
+    _doc_id, body = kb.updated[-1]
+    assert "abcdef1234567890" in body
+    assert "SHZT=99" in body
+    # 状态推进到已通过
+    assert kb.statuses == [(1, agent.STATUS_APPROVED)]
+
+
+def test_sync_is_idempotent() -> None:
+    body = LOG_NO_SQBH + "\n- 申请编号：abcdef1234567890\n- 学校状态：SHZT=99（已通过）\n"
+    kb = _sync_setup(body)
+    rows = [{"SQBH": "abcdef1234567890", "SHZT": "99", "JYYTMS": "新生见面会"}]
+    agent.sync_status(kb, rows, apply=True)
+    assert kb.updated == [] and kb.statuses == []
+
+
+def test_sync_withdrawn_maps_to_withdrawn_status() -> None:
+    kb = _sync_setup(LOG_NO_SQBH)
+    rows = [{"SQBH": "abcdef1234567890", "SHZT": "1", "JYYTMS": "新生见面会"}]
+    agent.sync_status(kb, rows, apply=True)
+    assert kb.statuses == [(1, agent.STATUS_WITHDRAWN)]
+
+
+def test_sync_pending_does_not_change_status() -> None:
+    kb = _sync_setup(LOG_NO_SQBH)
+    rows = [{"SQBH": "abcdef1234567890", "SHZT": "65", "JYYTMS": "新生见面会"}]
+    agent.sync_status(kb, rows, apply=True)
+    assert kb.statuses == []  # 待审核不改语雀状态
+    assert "SHZT=65" in kb.updated[-1][1]  # 但日志里记一笔
+
+
+def test_sync_unknown_sqbh_is_reported() -> None:
+    body = LOG_NO_SQBH + "\n- 申请编号：deadbeefdeadbeef\n"
+    kb = _sync_setup(body)
+    agent.sync_status(kb, [], apply=True)
+    assert kb.statuses == []
+    assert agent.MISSING in kb.updated[-1][1]
+
+
+def test_sync_dry_run_touches_nothing() -> None:
+    kb = _sync_setup(LOG_NO_SQBH)
+    rows = [{"SQBH": "abcdef1234567890", "SHZT": "99", "JYYTMS": "新生见面会"}]
+    agent.sync_status(kb, rows, apply=False)
+    assert kb.updated == [] and kb.statuses == []
+
+
+def test_sync_skips_archived_docs() -> None:
+    """归档是终点：归档区里的申请不再回写审核结果。"""
+    items = [
+        _toc("arch", "TITLE", "归档区"),
+        _toc("week", "TITLE", "0907-0913", parent="arch"),
+        _toc("n1", "DOC", "上周例会", parent="week", doc_id=1, slug="s1"),
+    ]
+    docs = [
+        Doc(id=1, slug="s1", title="上周例会", body="状态：已提交（待审核通过）"),
+        Doc(id=2, slug="log", title="审批日志", body=LOG_NO_SQBH),
+    ]
+    kb = _SyncKb(items, docs, NOW, log_id=2)
+    rows = [{"SQBH": "abcdef1234567890", "SHZT": "99", "JYYTMS": "上周例会"}]
+    agent.sync_status(kb, rows, apply=True)
+    assert kb.updated == [] and kb.statuses == []

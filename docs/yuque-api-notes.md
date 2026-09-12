@@ -136,14 +136,18 @@ sheets = json.loads(zlib.decompress(body_json["sheet"].encode("latin-1")).decode
 
 ### 4.2.1 移动节点（归档的关键）
 
-`editNode` + `node_uuid` + `target_uuid` = **把节点移动到另一个父节点下**（实测可用）：
+把**已有节点**移动到另一个父节点下，必须用 `appendNode` + **`node_uuid`**：
 
 ```json
-{"action": "editNode", "action_mode": "child",
+{"action": "appendNode", "action_mode": "child",
  "node_uuid": "<被移动的节点>", "target_uuid": "<新的父节点>"}
 ```
 
-归档 = 把过期的周目录节点移到 `99-归档` 分组下；搭配 `visible` 字段还能隐藏节点
+> ⚠️ 踩坑：`editNode` + `target_uuid` 会**返回 200 但什么都不做**（静默失败，最坑的一种）。
+> `action=moveNode` 会报 `422 action invalid`。区分要点：创建新节点用 `doc_ids`，
+> 移动已有节点用 `node_uuid`。
+
+归档 = 把过期的周目录节点移到 `归档区` 分组下；搭配 `visible` 字段还能隐藏节点
 （**但 `visible=0` 只是隐藏，不是只读**）。
 
 ### 4.3 知识库
@@ -243,3 +247,18 @@ GET /api/v2/doc_versions/{version_id}     → {body, body_md, body_html, body_as
 - 错误体形如 `{"status": 4xx, "message": "..."}`；客户端按状态码映射异常：
   `401 → AuthExpiredError`、`403 → InsufficientScopeError`、`404 → NotFoundError`、
   `429 → RateLimitedError`。
+
+## 12. 申请状态同步（本项目约定）
+
+语雀侧不存「申请是否通过」，只有状态机。要闭环得靠学校系统：
+
+```
+语雀文档 → agent 校验 → crb 提交 → 写 SQBH 到审批日志 → 状态「已提交（待审核通过）」
+                                        ↓  之后每次 --sync-status
+                         crb borrow list → SHZT → 回写「已通过」/「已撤回」
+```
+
+- 链接键：`审批日志` 里的 `申请编号：<SQBH>`；没有记录时用「标题 ⊂ JYYTMS」匹配一次并回填。
+- `SHZT` 映射：`65` 待审核（不变）／`99` 已通过／`1` 已撤回／`00` 草稿（不变）／未知值原样记录。
+- **只处理非归档文档**：归档是终点，晚到的审核结果不再回写。
+- 幂等：日志里记 `学校状态：SHZT=xx`，与上次相同则跳过；查不到申请记 `查无此申请`。

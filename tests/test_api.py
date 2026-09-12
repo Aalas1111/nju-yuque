@@ -159,3 +159,18 @@ def test_error_message_is_surfaced() -> None:
     with pytest.raises(AuthExpiredError) as info:
         api.hello()
     assert "请给此 Token 添加 doc 权限" in str(info.value)
+
+
+def test_toc_move_uses_append_node_with_node_uuid() -> None:
+    """回归：移动已有节点必须 appendNode+node_uuid；editNode+target_uuid 会静默失败。"""
+    rec = Recorder(payload={"data": []})
+    api = make_api(rec)
+    api.toc_move("ghxd00/mrge27", node_uuid="KID", target_uuid="PARENT")
+    body = rec.last.read().decode().replace(" ", "")
+    assert rec.last.method == "PUT"
+    assert str(rec.last.url).endswith("/api/v2/repos/ghxd00/mrge27/toc")
+    assert '"action":"appendNode"' in body
+    assert '"action_mode":"child"' in body
+    assert '"node_uuid":"KID"' in body
+    assert '"target_uuid":"PARENT"' in body
+    assert "doc_ids" not in body
