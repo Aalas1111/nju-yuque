@@ -54,25 +54,16 @@ ADVANCE_HOURS = 48  # 提前量
 DAY_START, DAY_END = 8 * 60, 22 * 60 + 20  # 可申请时段 08:00 - 22:20
 LUNCH_START, LUNCH_END = 12 * 60, 14 * 60  # 吃饭时间，不可重叠
 
-# 节次：(第几节, 实际上课开始, 实际上课结束分钟)
-# 匹配时按「一小时一档」处理（档位结束 = 开始 + 60 分），课间那 10 分钟不纠结：
-# 第 1 节 ≈ 08:00-09:00，第 7 节 ≈ 16:10-17:10。
-PERIODS: list[tuple[int, int, int]] = [
-    (1, 480, 530),
-    (2, 540, 590),
-    (3, 610, 660),
-    (4, 670, 720),
-    (5, 840, 890),
-    (6, 900, 950),
-    (7, 970, 1020),
-    (8, 1030, 1080),
-    (9, 1110, 1160),
-    (10, 1170, 1220),
-    (11, 1230, 1280),
-    (12, 1290, 1340),
-]
+# 真实上课时间（仅作对照）：第 1 节 08:00-08:50，第 7 节 16:10-17:00 ……
+PERIOD_STARTS = [480, 540, 610, 670, 840, 900, 970, 1030, 1110, 1170, 1230, 1290]
+PERIOD_ENDS = [530, 590, 660, 720, 890, 950, 1020, 1080, 1160, 1220, 1280, 1340]
 
-SLOT_MINUTES = 60  # 一节课按「一小时一档」匹配
+# 申请用的「一小时一档」：档位起点 = 真实起点向下取到 30 分钟，档长 60 分钟。
+# 于是 第1节 = 08:00-09:00、第7节 = 16:00-17:00（课间那 10 分钟不纠结），
+# 晚上 第9节 = 18:30-19:30（起点本来就在半点）。
+PERIODS: list[tuple[int, int, int]] = [
+    (i + 1, (s // 30) * 30, (s // 30) * 30 + 60) for i, s in enumerate(PERIOD_STARTS)
+]
 
 CAMPUSES: dict[str, tuple[str, str]] = {  # 别名 -> (规范名, 学校代码)
     "鼓楼": ("鼓楼", "1"),
@@ -220,10 +211,10 @@ def normalize_campus(raw: str) -> tuple[str, str, str]:
 def derive_periods(start: int, end: int) -> tuple[int, int] | None:
     """活动时间覆盖了哪些节次；返回 (起始节, 结束节)。
 
-    按「一小时一档」匹配：第 1 节 = 08:00-09:00、第 7 节 = 16:10-17:10，
-    课间那 10 分钟不算单独的档；比如 09:50-10:10 落在第 2 节。
+    按「一小时一档」匹配：第 1 节 = 08:00-09:00、第 7 节 = 16:00-17:00，
+    课间那 10 分钟不计；比如 16:10-18:00 → 第 7-8 节。
     """
-    used = [p for p, ps, _pe in PERIODS if min(end, ps + SLOT_MINUTES) > max(start, ps)]
+    used = [p for p, ps, pe in PERIODS if min(end, pe) > max(start, ps)]
     if not used:
         return None
     return min(used), max(used)
@@ -290,12 +281,10 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
 
     # --- 节次推算 ---
     if start is not None and end is not None and not v.problems:
-        # 匹配用的是「一小时一档」，所以不用把用户写的时间对齐到整点/半点
+        # 匹配用的是「一小时一档」，档位起点已经把课间 10 分钟舍掉了
         periods = derive_periods(start, end)
         if periods is None:
-            v.problems.append(
-                f"活动时间 {_hm(start)}-{_hm(end)} 对不上任何节次（整段都落在课间空档里）"
-            )
+            v.problems.append(f"活动时间 {_hm(start)}-{_hm(end)} 对不上任何节次")
         else:
             ksjc, jsjc = periods
             v.derived = {

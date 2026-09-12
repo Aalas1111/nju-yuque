@@ -49,12 +49,13 @@ def test_derive_periods_more() -> None:
     assert agent.derive_periods(8 * 60, 8 * 60 + 50) == (1, 1)
     assert agent.derive_periods(8 * 60, 12 * 60) == (1, 4)
     assert agent.derive_periods(14 * 60, 21 * 60 + 20) == (5, 11)
-    # 「一小时一档」：课间 10 分钟忽略
+    # 「一小时一档」：第7节 = 16:00-17:00，课间 10 分钟不计
     assert agent.derive_periods(16 * 60, 17 * 60) == (7, 7)
-    assert agent.derive_periods(9 * 60 + 50, 10 * 60 + 10) == (2, 2)
-    # 整段都在课间空档里 → 对不上任何节次
-    assert agent.derive_periods(10 * 60, 10 * 60 + 10) is None
+    assert agent.derive_periods(17 * 60 + 30, 18 * 60) == (8, 8)
+    assert agent.derive_periods(9 * 60 + 50, 10 * 60 + 10) == (2, 3)
+    # 不落在任何档位里
     assert agent.derive_periods(12 * 60 + 30, 13 * 60 + 30) is None
+    assert agent.derive_periods(3 * 60, 4 * 60) is None
 
 
 # ---------------------------------------------------------------- 规范化
@@ -156,12 +157,13 @@ def test_rejected_out_of_window() -> None:
     assert any("超出可申请时段" in p for p in v.problems)
 
 
-def test_rejected_gap_between_classes() -> None:
-    v = agent.evaluate(make(活动时间="10:00-10:10"), title="t", author="a", now=NOW)
-    assert not v.ok
-    assert any("对不上任何节次" in p for p in v.problems)
-    # 而 09:50-10:10 因为「一小时一档」算第 2 节，应当通过
-    assert agent.evaluate(make(活动时间="09:50-10:10"), title="t", author="a", now=NOW).ok
+def test_break_gap_counts_as_hour_block() -> None:
+    """「一小时一档」下，课间 10 分钟也归在相邻档位里（不纠结）。"""
+    v = agent.evaluate(make(活动时间="09:50-10:10"), title="t", author="a", now=NOW)
+    assert v.ok and v.derived["借用节次"] == "2-3"
+    # 而 12:30-13:30 在午饭时段，仍会被拒绝
+    v2 = agent.evaluate(make(活动时间="12:30-13:30"), title="t", author="a", now=NOW)
+    assert not v2.ok
 
 
 def test_rejected_missing_and_bad_campus() -> None:
