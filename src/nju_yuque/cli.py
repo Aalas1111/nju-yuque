@@ -501,6 +501,48 @@ def toc_add(
         _plain(f"[{item.type}] {item.title}  uuid={item.uuid}")
 
 
+@toc_app.command("edit")
+def toc_edit(
+    repo: str = typer.Option(..., "--repo", help="知识库 id 或 group/slug"),
+    node_uuid: str = typer.Option(..., "--node-uuid", help="要修改的目录节点 UUID"),
+    title: str = typer.Option(..., "--title", "-t", help="新的节点标题"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
+    """重命名目录节点（不改变层级）。"""
+    cred = _creds()
+    _require_write(cred, "doc")
+    try:
+        with _api(cred) as api:
+            api.toc_edit(repo, node_uuid=node_uuid, title=title)
+    except YuqueError as exc:
+        _fail(exc)
+    if json_out:
+        _dump({"edited": node_uuid, "title": title})
+        return
+    _plain(f"已重命名节点 {node_uuid} → {title}")
+
+
+@toc_app.command("move")
+def toc_move(
+    repo: str = typer.Option(..., "--repo", help="知识库 id 或 group/slug"),
+    node_uuid: str = typer.Option(..., "--node-uuid", help="要移动的目录节点 UUID"),
+    parent: str = typer.Option(..., "--parent", help="目标父节点 UUID"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
+    """移动目录节点到另一个父节点下（归档 / 纠正位置）。"""
+    cred = _creds()
+    _require_write(cred, "doc")
+    try:
+        with _api(cred) as api:
+            api.toc_move(repo, node_uuid=node_uuid, target_uuid=parent)
+    except YuqueError as exc:
+        _fail(exc)
+    if json_out:
+        _dump({"moved": node_uuid, "parent": parent})
+        return
+    _plain(f"已移动节点 {node_uuid} → 父节点 {parent}")
+
+
 @toc_app.command("remove")
 def toc_remove(
     repo: str = typer.Option(..., "--repo", help="知识库 id 或 group/slug"),

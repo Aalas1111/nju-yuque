@@ -22,7 +22,7 @@ from urllib.parse import quote
 import httpx
 
 from .config import USER_AGENT
-from .errors import WrongModeError, raise_for_status
+from .errors import WrongModeError, YuqueError, raise_for_status
 from .session import SESSION_COOKIE, Credentials
 
 PAGE_SIZE = 100
@@ -81,13 +81,17 @@ class YuqueWeb:
         params: dict[str, Any] | None = None,
         json_body: Any | None = None,
     ) -> Any:
-        resp = self.client.request(
-            method,
-            path,
-            params={k: v for k, v in (params or {}).items() if v is not None},
-            json=json_body,
-            headers=self._headers(write=write, referer=referer),
-        )
+        """发一次请求，把网络层异常统一包成 YuqueError。"""
+        try:
+            resp = self.client.request(
+                method,
+                path,
+                params={k: v for k, v in (params or {}).items() if v is not None},
+                json=json_body,
+                headers=self._headers(write=write, referer=referer),
+            )
+        except httpx.HTTPError as exc:
+            raise YuqueError(f"网络请求失败（{type(exc).__name__}）：{exc}") from exc
         if resp.status_code >= 400:
             message = ""
             try:

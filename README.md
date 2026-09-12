@@ -216,6 +216,28 @@ uv run python scripts/sync_skill.py     # 改完 SKILL.md 后同步仓库内副�
 
 ---
 
+## 示例：教室申请知识库自动维护 agent
+
+`examples/classroom_application_agent.py` 是一个真实场景的参考实现：
+
+- 审核申请文档（状态 / 必填 / 提前 48 小时 / 节次 / 人数）；
+- 规范合规文档的**状态**（`待提交` → `已登记（等待提交教室申请）` / `已退回（修改后请把状态改为待提交）`）；
+- 在申请文档下维护子文档 **`审批日志`**（时间戳 + 结论 + 意见）；
+- 放错位置但能识别的文档 → 移动到对应的周目录（如 `0914-0920`）；
+- 无法识别的文档 → 删除；过期周目录 → 移到 `归档区`。
+
+```bash
+# 默认 dry-run，只打印计划
+uv run python examples/classroom_application_agent.py --repo <group/slug>
+# 确认无误后执行
+uv run python examples/classroom_application_agent.py --repo <group/slug> --apply
+```
+
+> 规则细节见 [`docs/permission-feasibility.md`](docs/permission-feasibility.md)；
+> 语雀接口的坑见 [`docs/yuque-api-notes.md`](docs/yuque-api-notes.md)。
+
+---
+
 ## 免责声明
 
 本项目是社区自发的自动化工具，与语雀官方无关。Cookie 模式依赖非公开网页接口，

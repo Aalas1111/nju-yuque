@@ -54,12 +54,15 @@ class YuqueApi:
         json_body: Any | None = None,
     ) -> Any:
         """发一次请求，返回语雀原始响应体（不拆 ``data``）。"""
-        resp = self.client.request(
-            method,
-            path,
-            params={k: v for k, v in (params or {}).items() if v is not None},
-            json=json_body,
-        )
+        try:
+            resp = self.client.request(
+                method,
+                path,
+                params={k: v for k, v in (params or {}).items() if v is not None},
+                json=json_body,
+            )
+        except httpx.HTTPError as exc:
+            raise YuqueError(f"网络请求失败（{type(exc).__name__}）：{exc}") from exc
         scopes = resp.headers.get("x-oauth-scopes")
         if scopes:
             self.scopes = scopes
@@ -263,6 +266,17 @@ class YuqueApi:
             "action": "removeNode",
             "action_mode": "child" if with_children else "sibling",
             "node_uuid": node_uuid,
+        }
+        data = self._unwrap(self._request("PUT", f"/api/v2/repos/{repo}/toc", json_body=payload))
+        return [TocItem.model_validate(x) for x in (data or [])]
+
+    def toc_move(self, repo: str, *, node_uuid: str, target_uuid: str) -> list[TocItem]:
+        """把已有目录节点移动到另一个父节点下（归档 / 纠正位置）。"""
+        payload = {
+            "action": "editNode",
+            "action_mode": "child",
+            "node_uuid": node_uuid,
+            "target_uuid": target_uuid,
         }
         data = self._unwrap(self._request("PUT", f"/api/v2/repos/{repo}/toc", json_body=payload))
         return [TocItem.model_validate(x) for x in (data or [])]
