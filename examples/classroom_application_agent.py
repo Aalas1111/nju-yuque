@@ -37,9 +37,11 @@ from nju_yuque.models import Doc
 from nju_yuque.session import Credentials
 
 # ---------------------------------------------------------------- 知识库约定
-GUIDE_TITLE = "00-指导文档（必读）"
-LOG_TITLE = "审批日志"  # 申请文档下由 agent 维护的子文档
+# 结构性文档靠标题关键词识别（标题可被人工改，不能写死全名）
+GUIDE_TITLE = "指导文档"
 ARCHIVE_TITLE = "归档区"
+LOG_TITLE = "审批日志"
+STRUCTURAL_HINTS = ("指导文档", "填表说明", "申请模板", "使用说明", "README")
 # 周目录命名：0914-0920（MMDD-MMDD），后面允许跟任意说明文字
 WEEK_TITLE_RE = re.compile(r"^(\d{2})(\d{2})\s*[-~～]\s*(\d{2})(\d{2})")
 
@@ -210,6 +212,16 @@ def normalize_campus(raw: str) -> tuple[str, str, str]:
     return "", "", ""
 
 
+def is_structural(title: str) -> bool:
+    """结构性文档（指导文档 / 归档区 / 审批日志 / 模板）不参与申请审核。
+
+    不能用标题全等匹配：标题是人工可以改的（实测就被改过）。
+    """
+    if title in {GUIDE_TITLE, ARCHIVE_TITLE, LOG_TITLE}:
+        return True
+    return any(hint in title for hint in STRUCTURAL_HINTS)
+
+
 def subtract_lunch(start: int, end: int) -> list[tuple[int, int]]:
     """从 [start, end) 里剔除 12:00-14:00 吃饭时间，返回剩下的可用区间。
 
@@ -266,6 +278,7 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
     for name in REQUIRED_FIELDS:
         if not v.fields.get(name):
             v.problems.append(f"「{name}」为空，且无法推断")
+        # 具体格式问题（能解析失败但非空）由下面各段单独补充
 
     # --- 日期 ---
     date, date_fix = normalize_date(v.fields.get("活动日期", ""), now)
@@ -281,10 +294,9 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
     if time_fix:
         v.fixes.append(time_fix)
     if start is None or end is None:
-        if v.fields.get("活动时间"):
+        # 字段为空的情况已在上面的必填循环里报过，这里只管「填了但解析不出来」
+        if v.fields.get("活动时间") and (start is None or end is None):
             v.problems.append(f"「活动时间」无法解析：{v.fields['活动时间']}")
-        else:
-            v.problems.append("「活动时间」为空")
     else:
         if start >= end:
             v.problems.append(f"活动时间前后颠倒：{_hm(start)}-{_hm(end)}")
@@ -307,8 +319,8 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
         v.fixes.append(campus_fix)
     if not campus and v.fields.get("校区"):
         v.problems.append(f"「校区」不认识：{v.fields['校区']}（应填 鼓楼/浦口/仙林/苏州）")
-    elif not campus:
-        v.problems.append("「校区」为空（鼓楼/浦口/仙林/苏州）")
+    elif not campus and not v.fields.get("校区"):
+        pass  # 空值已在上面的必填循环里报过
 
     # --- 节次推算 ---
     if start is not None and end is not None and not v.problems:
@@ -512,14 +524,14 @@ def plan(kb: Kb) -> list[tuple[Doc, object, Verdict]]:
     path = Kb.node_path(items)
     doc_node = {i.doc_id: i for i in items if i.doc_id}
     week_dirs = [i for i in items if i.type == "TITLE" and WEEK_TITLE_RE.match(i.title)]
-    structural = {GUIDE_TITLE, ARCHIVE_TITLE, LOG_TITLE}
 
     out = []
     for doc in kb.docs():
         node = doc_node.get(doc.id)
         in_archive = bool(node) and ARCHIVE_TITLE in path.get(node.uuid, [])
 
-        if doc.title in structural:
+        # 结构性文档：标题关键词匹配（标题可能被人改，不能写死全名）
+        if is_structural(doc.title):
             out.append((doc, node, Verdict("skip", tier="skip", note="结构性文档")))
             continue
 
@@ -551,10 +563,12 @@ def plan(kb: Kb) -> list[tuple[Doc, object, Verdict]]:
             date = datetime.strptime(str(v.derived["日期"]), "%Y-%m-%d").replace(tzinfo=CN)
         target = _week_dir_for(week_dirs, date, kb.now)
         if target is None:
-            v.problems.append("活动日期不在当前可申请的周目录范围内（只接受当前周与下一周）")
-            v.ok = False
-            v.tier = "rejected"
-            v.new_status = STATUS_REJECTED
+            # 只有真解析出日期、但落在任何周目录之外时才报这个
+            if date is not None:
+                v.problems.append("活动日期不在当前可申请的周目录范围内（只接受当前周与下一周）")
+                v.ok = False
+                v.tier = "rejected"
+                v.new_status = STATUS_REJECTED
         elif in_archive or node is None or node.parent_uuid != target.uuid:
             v.action = "move"
             v.target_title = target.title

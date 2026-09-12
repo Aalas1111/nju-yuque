@@ -238,3 +238,21 @@ def test_set_status_prepends_when_missing() -> None:
     out = agent.set_status("活动名称：X\n", agent.STATUS_SUBMITTED)
     assert out.startswith(f"状态：{agent.STATUS_SUBMITTED}")
     assert "活动名称：X" in out
+
+
+# ---------------------------------------------------------------- 结构性文档识别
+def test_is_structural_tolerates_renamed_guide() -> None:
+    """实测：指导文档被人工改过标题（去掉 00- 前缀），必须仍被跳过。"""
+    assert agent.is_structural("指导文档（必读）")
+    assert agent.is_structural("00-指导文档（必读）")
+    assert agent.is_structural("填表说明")
+    assert agent.is_structural("归档区")
+    assert agent.is_structural("审批日志")
+    assert agent.is_structural("教室申请模板（复制后填写）")
+    assert agent.is_structural("README")
+
+
+def test_is_structural_does_not_eat_activities() -> None:
+    assert not agent.is_structural("新生见面会")
+    assert not agent.is_structural("社团分享会")
+    assert not agent.is_structural("思维训练营")
