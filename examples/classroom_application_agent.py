@@ -208,6 +208,22 @@ def normalize_campus(raw: str) -> tuple[str, str, str]:
     return "", "", ""
 
 
+def subtract_lunch(start: int, end: int) -> list[tuple[int, int]]:
+    """从 [start, end) 里剔除 12:00-14:00 吃饭时间，返回剩下的区间。
+
+    午饭时段不是「违规」，而是「不需要借教室」：
+    - 完全落在午饭内 → 返回空 → 不需要借教室，退回
+    - 只跨到一边（13:00-15:00）→ 取 14:00-15:00
+    - 两边都跨（11:00-15:00）→ 返回两段 → 请申请人拆成上下午两场
+    """
+    out: list[tuple[int, int]] = []
+    if start < LUNCH_START:
+        out.append((start, min(end, LUNCH_START)))
+    if end > LUNCH_END:
+        out.append((max(start, LUNCH_END), end))
+    return [(s, e) for s, e in out if e > s]
+
+
 def derive_periods(start: int, end: int) -> tuple[int, int] | None:
     """活动时间覆盖了哪些节次；返回 (起始节, 结束节)。
 
@@ -251,6 +267,7 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
 
     # --- 时间 ---
     start, end, time_fix = normalize_time(v.fields.get("活动时间", ""))
+    orig_start = start  # 48 小时按「活动真实开始时间」算，不受剔除午饭影响
     if time_fix:
         v.fixes.append(time_fix)
     if start is None or end is None:
@@ -265,10 +282,24 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
             v.problems.append(
                 f"活动时间 {_hm(start)}-{_hm(end)} 超出可申请时段 {_hm(DAY_START)}-{_hm(DAY_END)}"
             )
-        if start < LUNCH_END and end > LUNCH_START:
+        # 剔除吃饭时间：不是「违规」，而是这段时间不需要借教室
+        bookable = subtract_lunch(start, end)
+        if not bookable:
             v.problems.append(
-                f"活动时间 {_hm(start)}-{_hm(end)} 与 {_hm(LUNCH_START)}-{_hm(LUNCH_END)} 吃饭时间重叠"
+                f"活动时间 {_hm(start)}-{_hm(end)} 完全落在 {_hm(LUNCH_START)}-{_hm(LUNCH_END)} "
+                "吃饭时间内，不需要借教室"
             )
+        elif len(bookable) > 1:
+            v.problems.append(
+                f"活动横跨 {_hm(LUNCH_START)}-{_hm(LUNCH_END)} 吃饭时间（{_hm(start)}-{_hm(end)}），"
+                "请拆成上下午两场分别申请"
+            )
+        elif bookable[0] != (start, end):
+            bs, be = bookable[0]
+            v.fixes.append(
+                f"吃饭时间不需要借教室，活动时间 {_hm(start)}-{_hm(end)} → 只借 {_hm(bs)}-{_hm(be)}"
+            )
+            start, end = bs, be
 
     # --- 校区 ---
     campus, campus_code, campus_fix = normalize_campus(v.fields.get("校区", ""))
@@ -301,9 +332,9 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
                 "人数": DEFAULT_PEOPLE,
                 "联系电话": DEFAULT_CONTACT,
             }
-            # --- 提前 48 小时 ---
-            if date is not None:
-                act_start = date.replace(hour=start // 60, minute=start % 60)
+            # --- 提前 48 小时（按活动真实开始时间） ---
+            if date is not None and orig_start is not None:
+                act_start = date.replace(hour=orig_start // 60, minute=orig_start % 60)
                 gap = act_start - now
                 if gap < timedelta(hours=ADVANCE_HOURS):
                     hours = gap.total_seconds() / 3600

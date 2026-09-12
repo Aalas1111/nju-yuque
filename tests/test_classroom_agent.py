@@ -143,12 +143,31 @@ def test_rejected_too_soon() -> None:
     assert any("不足 48 小时" in p for p in v.problems)
 
 
-def test_rejected_lunch_overlap() -> None:
-    v = agent.evaluate(make(活动时间="11:30-12:30"), title="t", author="a", now=NOW)
+def test_lunch_fully_inside_is_rejected() -> None:
+    v = agent.evaluate(make(活动时间="12:30-13:30"), title="t", author="a", now=NOW)
     assert not v.ok
-    assert any("吃饭时间" in p for p in v.problems)
-    # 正好 11:00-12:00 不吃午饭时间，应通过
-    assert agent.evaluate(make(活动时间="11:00-12:00"), title="t", author="a", now=NOW).ok
+    assert any("不需要借教室" in p for p in v.problems)
+
+
+def test_lunch_partial_overlap_is_clamped() -> None:
+    """午饭时段不是「违规」，而是这段不需要借教室。"""
+    # 13:00-15:00 → 只借 14:00-15:00
+    v = agent.evaluate(make(活动时间="13:00-15:00"), title="t", author="a", now=NOW)
+    assert v.ok and v.tier == "normalized"
+    assert v.derived["开始"] == "14:00" and v.derived["结束"] == "15:00"
+    assert v.derived["借用节次"] == "5"
+    assert any("只借" in f for f in v.fixes)
+    # 11:30-12:30 → 只借 11:30-12:00（第 4 节）
+    v2 = agent.evaluate(make(活动时间="11:30-12:30"), title="t", author="a", now=NOW)
+    assert v2.ok and v2.derived["借用节次"] == "4"
+    # 正好 11:00-12:00 / 14:00-15:00 不用改
+    assert agent.evaluate(make(活动时间="11:00-12:00"), title="t", author="a", now=NOW).tier == "ok"
+
+
+def test_lunch_spanning_both_sides_is_rejected() -> None:
+    v = agent.evaluate(make(活动时间="11:00-15:00"), title="t", author="a", now=NOW)
+    assert not v.ok
+    assert any("拆成上下午两场" in p for p in v.problems)
 
 
 def test_rejected_out_of_window() -> None:
