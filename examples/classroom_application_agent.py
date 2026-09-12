@@ -31,17 +31,22 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from nju_yuque import config
 from nju_yuque.api import YuqueApi
 from nju_yuque.errors import YuqueError
 from nju_yuque.models import Doc
 from nju_yuque.session import Credentials
 
 # ---------------------------------------------------------------- 知识库约定
-# 结构性文档靠标题关键词识别（标题可被人工改，不能写死全名）
-GUIDE_TITLE = "指导文档"
 ARCHIVE_TITLE = "归档区"
-LOG_TITLE = "审批日志"
-STRUCTURAL_HINTS = ("指导文档", "填表说明", "申请模板", "使用说明", "README")
+LOG_TITLE = "审批日志"  # agent 维护的子文档；靠「父节点是文档」识别，不靠标题
+GUIDE_HINTS = ("指导文档", "填表说明")  # 仅用于首次自动识别指导文档
+
+# 文档标题 **就是活动名称**。以下是「没填标题」或「想冒充系统文档」的标题：
+# 都当成不合规退回，而不是跳过（否则有人把申请命名成「指导文档」就能逃避审查）。
+TITLE_BAD_EXACT = {"", "无标题文档", "无标题"}
+TITLE_BAD_HINTS = ("指导文档", "填表说明", "申请模板", "使用说明", "审批日志", "归档区", "README")
+MAX_TITLE_LEN = 60
 # 周目录命名：0914-0920（MMDD-MMDD），后面允许跟任意说明文字
 WEEK_TITLE_RE = re.compile(r"^(\d{2})(\d{2})\s*[-~～]\s*(\d{2})(\d{2})")
 
@@ -81,7 +86,7 @@ DEFAULT_PEOPLE = 30  # 人数不详时按「足够少，随便借一间」处理
 
 CN = timezone(timedelta(hours=8))
 
-REQUIRED_FIELDS = ("活动名称", "申请人", "活动日期", "活动时间", "校区")
+REQUIRED_FIELDS = ("申请人", "活动日期", "活动时间", "校区")
 FILL_FIELDS = ("教学楼", "教室")
 ALL_FIELDS = ("状态", *REQUIRED_FIELDS, *FILL_FIELDS)
 
@@ -212,14 +217,17 @@ def normalize_campus(raw: str) -> tuple[str, str, str]:
     return "", "", ""
 
 
-def is_structural(title: str) -> bool:
-    """结构性文档（指导文档 / 归档区 / 审批日志 / 模板）不参与申请审核。
-
-    不能用标题全等匹配：标题是人工可以改的（实测就被改过）。
-    """
-    if title in {GUIDE_TITLE, ARCHIVE_TITLE, LOG_TITLE}:
-        return True
-    return any(hint in title for hint in STRUCTURAL_HINTS)
+def title_problem(title: str) -> str | None:
+    """文档标题即活动名称；返回不合规原因（None 表示合规）。"""
+    t = (title or "").strip()
+    if t in TITLE_BAD_EXACT:
+        return "文档标题为空（语雀会显示成「无标题文档」），请把标题写成活动名称"
+    for hint in TITLE_BAD_HINTS:
+        if hint in t:
+            return f"文档标题「{t}」和系统文档重名，请把标题写成活动名称"
+    if len(t) > MAX_TITLE_LEN:
+        return f"文档标题有 {len(t)} 个字，太长；请用简短的活动名称"
+    return None
 
 
 def subtract_lunch(start: int, end: int) -> list[tuple[int, int]]:
@@ -268,10 +276,11 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
         v.note = f"状态为「{status or '缺失'}」，跳过（只处理「{STATUS_PENDING}」）"
         return v
 
+    # --- 标题（= 活动名称）---
+    if problem := title_problem(title):
+        v.problems.append(problem)
+
     # --- 必填字段：能推断的就推断（agent 的职责） ---
-    if not fields.get("活动名称") and title:
-        v.fields["活动名称"] = title
-        v.fixes.append(f"活动名称缺失 → 用文档标题「{title}」")
     if not fields.get("申请人") and author:
         v.fields["申请人"] = author
         v.fixes.append(f"申请人缺失 → 用文档创建者「{author}」")
@@ -337,6 +346,7 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
                     f"按可用时段推得第 {span} 节"
                 )
             v.derived = {
+                "活动名称": title,
                 "日期": f"{date:%Y-%m-%d}" if date else "",
                 "开始": _hm(start),
                 "结束": _hm(end),
@@ -381,7 +391,6 @@ def salvage(body: str, *, title: str, author: str, now: datetime) -> Verdict | N
         return None
     fields = {
         "状态": STATUS_PENDING,
-        "活动名称": title,
         "申请人": author,
         "活动日期": f"{date:%Y-%m-%d}",
         "活动时间": f"{_hm(start)}-{_hm(end)}",
@@ -400,6 +409,7 @@ class Kb:
         if not cred.is_token:
             raise SystemExit("需要令牌模式：请先 `yuque login --token <写权限令牌>`")
         self.repo = repo
+        self.host = cred.host
         self.api = YuqueApi(cred.host, cred.token, group=cred.group)
         self.now = datetime.now(CN)
 
@@ -459,7 +469,7 @@ class Kb:
             head = f"### {stamp} · 校验通过，已提交"
             lines = [
                 "- 结论：**通过**",
-                f"- 活动：{v.fields.get('活动名称', '')} / {v.derived.get('日期', '')} "
+                f"- 活动：{app.title} / {v.derived.get('日期', '')} "
                 f"{v.derived.get('开始', '')}-{v.derived.get('结束', '')}",
                 f"- 借用节次：**{v.derived.get('借用节次', '')}**（由活动时间推算）",
                 f"- 校区：{v.derived.get('校区', '')}（{v.derived.get('XXXQDM', '')}）"
@@ -519,10 +529,44 @@ def _week_dir_for(week_dirs: list, date: datetime | None, now: datetime):
     return None
 
 
-def plan(kb: Kb) -> list[tuple[Doc, object, Verdict]]:
+def resolve_guide_id(kb: Kb, override: str | None = None) -> int | None:
+    """确定「指导文档」的 doc id（首次自动识别并持久化，之后按 id 锁定）。
+
+    不能靠标题判断：标题既可被人工改动，也可被申请人冒充。
+    """
+    key = f"{kb.host}|{kb.repo}"
+    state = config.load_state()
+
+    if override:
+        target = override.strip()
+        found = next((d for d in kb.docs() if str(d.id) == target or d.slug == target), None)
+        if found is None:
+            raise SystemExit(f"--guide 指定的文档找不到：{target}")
+        state.setdefault(key, {})["guide_doc_id"] = found.id
+        config.save_state(state)
+        return found.id
+
+    saved = (state.get(key) or {}).get("guide_doc_id")
+    if saved:
+        return int(saved)
+
+    items = kb.toc()
+    root_docs = {i.doc_id for i in items if i.doc_id and not i.parent_uuid}
+    for doc in kb.docs():
+        if doc.id in root_docs and any(h in doc.title for h in GUIDE_HINTS):
+            state.setdefault(key, {})["guide_doc_id"] = doc.id
+            config.save_state(state)
+            print(f"（首次自动识别指导文档：#{doc.id} {doc.title}）", file=sys.stderr)
+            return doc.id
+    print("! 未能识别指导文档，请用 --guide <doc_id> 指定", file=sys.stderr)
+    return None
+
+
+def plan(kb: Kb, guide_id: int | None = None) -> list[tuple[Doc, object, Verdict]]:
     items = kb.toc()
     path = Kb.node_path(items)
     doc_node = {i.doc_id: i for i in items if i.doc_id}
+    doc_node_uuids = {i.uuid for i in items if i.doc_id}
     week_dirs = [i for i in items if i.type == "TITLE" and WEEK_TITLE_RE.match(i.title)]
 
     out = []
@@ -530,9 +574,13 @@ def plan(kb: Kb) -> list[tuple[Doc, object, Verdict]]:
         node = doc_node.get(doc.id)
         in_archive = bool(node) and ARCHIVE_TITLE in path.get(node.uuid, [])
 
-        # 结构性文档：标题关键词匹配（标题可能被人改，不能写死全名）
-        if is_structural(doc.title):
-            out.append((doc, node, Verdict("skip", tier="skip", note="结构性文档")))
+        # 结构性文档：① 指导文档按 doc id 锁定（标题可被改、也可被冒充，不能看标题）
+        #             ② 审批日志靠「父节点本身是一篇文档」识别
+        if guide_id is not None and doc.id == guide_id:
+            out.append((doc, node, Verdict("skip", tier="skip", note="指导文档（结构性）")))
+            continue
+        if doc.title == LOG_TITLE and node is not None and node.parent_uuid in doc_node_uuids:
+            out.append((doc, node, Verdict("skip", tier="skip", note="审批日志（结构性）")))
             continue
 
         detail = kb.read(doc.id)
@@ -621,6 +669,9 @@ def main() -> None:
     ap.add_argument("--repo", required=True, help="知识库 id 或 group/slug")
     ap.add_argument("--apply", action="store_true", help="真正执行（默认只打印计划）")
     ap.add_argument(
+        "--guide", metavar="doc_id|slug", help="指导文档 id（首次可自动识别，之后锁定）"
+    )
+    ap.add_argument(
         "--approve",
         action="append",
         default=[],
@@ -640,9 +691,10 @@ def main() -> None:
         items = kb.toc()
         path = Kb.node_path(items)
         archive = next((i for i in items if i.type == "TITLE" and i.title == ARCHIVE_TITLE), None)
+        guide_id = resolve_guide_id(kb, args.guide)
 
         print(f"# KB={args.repo}  现在={kb.now:%Y-%m-%d %H:%M} (UTC+8)  dry_run={not args.apply}\n")
-        reports = plan(kb)
+        reports = plan(kb, guide_id)
         for doc, node, v in reports:
             loc = " / ".join(path.get(node.uuid, [])) if node else "(不在目录)"
             print(f"## {doc.title}  (#{doc.id})")

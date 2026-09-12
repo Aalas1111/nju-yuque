@@ -25,7 +25,6 @@ NOW = datetime(2026, 9, 12, 9, 0, tzinfo=agent.CN)  # 假设现在是 09-12 09:0
 def make(**over: str) -> dict[str, str]:
     base = {
         "状态": "待提交",
-        "活动名称": "新生见面会",
         "申请人": "张三",
         "活动日期": "2026-09-16",
         "活动时间": "16:10-18:00",
@@ -127,11 +126,16 @@ def test_optional_fields_can_be_empty() -> None:
     assert v.derived["教学楼"] == "(随机)" and v.derived["教室"] == "(随机)"
 
 
-def test_fallback_name_and_applicant() -> None:
-    v = agent.evaluate(make(活动名称="", 申请人=""), title="社团分享会", author="李四", now=NOW)
+def test_fallback_applicant_from_creator() -> None:
+    v = agent.evaluate(make(申请人=""), title="社团分享会", author="李四", now=NOW)
     assert v.ok and v.tier == "normalized"
-    assert v.fields["活动名称"] == "社团分享会"
     assert v.fields["申请人"] == "李四"
+    assert v.derived["活动名称"] == "社团分享会"
+
+
+def test_title_is_the_activity_name() -> None:
+    v = agent.evaluate(make(), title="新生见面会", author="张三", now=NOW)
+    assert v.ok and v.derived["活动名称"] == "新生见面会"
 
 
 def test_rejected_too_soon() -> None:
@@ -240,19 +244,27 @@ def test_set_status_prepends_when_missing() -> None:
     assert "活动名称：X" in out
 
 
-# ---------------------------------------------------------------- 结构性文档识别
-def test_is_structural_tolerates_renamed_guide() -> None:
-    """实测：指导文档被人工改过标题（去掉 00- 前缀），必须仍被跳过。"""
-    assert agent.is_structural("指导文档（必读）")
-    assert agent.is_structural("00-指导文档（必读）")
-    assert agent.is_structural("填表说明")
-    assert agent.is_structural("归档区")
-    assert agent.is_structural("审批日志")
-    assert agent.is_structural("教室申请模板（复制后填写）")
-    assert agent.is_structural("README")
+# ---------------------------------------------------------------- 标题（= 活动名称）
+def test_title_must_not_be_blank_or_impersonate_system_doc() -> None:
+    """没填标题 / 想冒充「指导文档」逃避审查的，都要退回而不是跳过。"""
+    assert agent.title_problem("") is not None
+    assert agent.title_problem("无标题文档") is not None
+    assert agent.title_problem("指导文档（必读）") is not None
+    assert agent.title_problem("00-指导文档") is not None
+    assert agent.title_problem("审批日志") is not None
+    assert agent.title_problem("归档区") is not None
+    assert agent.title_problem("教室申请模板") is not None
+    assert agent.title_problem("README") is not None
+    assert agent.title_problem("A" * 61) is not None
 
 
-def test_is_structural_does_not_eat_activities() -> None:
-    assert not agent.is_structural("新生见面会")
-    assert not agent.is_structural("社团分享会")
-    assert not agent.is_structural("思维训练营")
+def test_normal_activity_titles_are_fine() -> None:
+    for title in ("新生见面会", "社团分享会", "思维训练营第 3 期", "读书会"):
+        assert agent.title_problem(title) is None
+
+
+def test_blank_title_is_rejected() -> None:
+    v = agent.evaluate(make(), title="无标题文档", author="张三", now=NOW)
+    assert not v.ok and any("标题" in p for p in v.problems)
+    v2 = agent.evaluate(make(), title="指导文档（必读）", author="张三", now=NOW)
+    assert not v2.ok and any("重名" in p for p in v2.problems)
