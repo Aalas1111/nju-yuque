@@ -39,6 +39,30 @@ def parse_cookie_string(raw: str) -> dict[str, str]:
     return out
 
 
+def scope_allows_write(scopes: str, kind: str) -> bool:
+    """判断令牌 scope 是否具备某类对象的写权限。
+
+    语雀的 scope 命名：只读是 ``doc:read``，读写直接是 ``doc``（没有 ``:read`` 后缀）；
+    也有令牌会写成 ``doc:write``。两种写法都认。
+    """
+    for scope in (scopes or "").split(","):
+        scope = scope.strip()
+        if not scope:
+            continue
+        head, _, tail = scope.partition(":")
+        if head != kind:
+            continue
+        if tail in {"read"}:
+            continue
+        return True
+    return False
+
+
+def write_kinds(scopes: str) -> list[str]:
+    """列出令牌拥有写权限的对象类型（供 doctor 展示）。"""
+    return [k for k in ("doc", "repo", "group", "statistic") if scope_allows_write(scopes, k)]
+
+
 @dataclass
 class Credentials:
     """一次登录的结果。"""

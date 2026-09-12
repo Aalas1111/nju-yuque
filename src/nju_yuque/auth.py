@@ -89,6 +89,9 @@ def login_token(
         name=str(who.get("name") or ""),
         scopes=scopes,
     )
+    # 团队令牌的 whoami 会返回所属团队：以服务端为准（否则会拿错 group 去查别的团队）
+    if str(who.get("type") or "") == "Group" and who.get("login"):
+        cred.group = str(who["login"])
     cred.save(path)
     return cred
 

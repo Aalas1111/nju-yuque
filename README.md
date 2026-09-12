@@ -33,10 +33,12 @@
 | 稳定性 | ✅ 官方接口，长期有效 | ⚠️ 非公开接口，登录态约 2 周过期 |
 | 列表 / 搜索 / 目录 / 成员 | ✅ | 部分 |
 | 读文档正文 / **读表格** | ✅ | ✅ |
+| 建 / 改 / 删文档、挂目录、建知识库 | 需令牌带 `doc` / `repo` 写 scope | ✅ |
 | **评论 / 回复 / @人** | ❌（官方无评论接口） | ✅ |
-| 写 / 改 / 删文档 | 需要带 `doc:write` 的令牌 | ✅ |
 
-> 一句话：**能拿到带写权限的令牌就优先用令牌**；只有「发评论通知人」这件事必须走 Cookie。
+> 语雀 scope 里 `doc`（无 `:read`）= 读写，`doc:read` = 只读。
+> 团队令牌会自动识别所属团队，`yuque doctor` 里看到的 `group` 才是真的。
+> 一句话：**能拿到带写权限的令牌就优先用令牌**；只有「发评论通知人」必须走 Cookie。
 
 ---
 
@@ -86,21 +88,40 @@ yuque doc   https://nova.yuque.com/ghxd00/mrge27/bbf1n662v36gd85q --json
 
 ## 命令速查
 
+### 读
+
 | 命令 | 作用 |
 |---|---|
 | `yuque login [--token/--cookie] [--host/--group]` | 登录（令牌 / Cookie / 浏览器） |
 | `yuque logout` | 清除本地凭证 |
-| `yuque doctor --json` | 自检：模式 / 身份 / scope / 能力边界 |
+| `yuque doctor --json` | 自检：模式 / 团队 / scope / 能力边界 |
 | `yuque repos --json` | 知识库列表 |
-| `yuque toc --repo <id 或 group/slug> --json` | 目录树（含层级） |
+| `yuque toc list --repo <id 或 group/slug> --json` | 目录树（含层级） |
 | `yuque docs --repo <...> -n 200 --type Sheet --json` | 文档列表（含 `updated_at`） |
 | `yuque search <关键词> --scope group/slug --json` | 全文搜索 |
-| `yuque doc <链接> [--raw] [--json]` | 读正文 Markdown |
+| `yuque doc get <链接> [--raw] [--json]` | 读正文 Markdown |
 | `yuque table <链接> [--csv] [--json] [--sheet <名>]` | 读语雀表格（结构化 / CSV） |
 | `yuque members --json` | 成员 `user_id → 姓名` |
 | `yuque watch --repo <...> [--since ISO] [--json]` | 自上次以来有变动的文档 |
-| `yuque comment list <链接>` | 列出评论（Cookie 模式） |
-| `yuque comment add <链接> -m "..." --mention <login>` | 发评论 / @人（Cookie 模式） |
+
+### 写（需要写权限令牌；支持 `--dry-run` 预览）
+
+| 命令 | 作用 |
+|---|---|
+| `yuque doc create --repo <...> -t <标题> -f body.md [--no-toc] [--parent <uuid>]` | 新建文档（默认自动挂目录） |
+| `yuque doc update <链接> [--title] [-f body.md]` | 更新文档（只改传入字段） |
+| `yuque doc delete <链接> --yes` | 删除文档 |
+| `yuque toc add --repo <...> [--doc-id N] [--type TITLE] [-t 名] [--parent <uuid>]` | 挂载文档 / 建分组 |
+| `yuque toc remove --repo <...> --node-uuid <uuid> --yes` | 从目录移除节点（不删文档） |
+| `yuque repo create --name <名> [--slug] [--description] [--public 2]` | 新建知识库 |
+| `yuque repo delete --repo <...> --yes` | 删除知识库（连带文档） |
+
+### 评论（Cookie 模式）
+
+| 命令 | 作用 |
+|---|---|
+| `yuque comment list <链接>` | 列出评论 |
+| `yuque comment add <链接> -m "..." --mention <login>` | 发评论 / @人 |
 | `yuque skill path / show / install` | 内置 AI Skill |
 
 > 所有命令都支持 `--json`；不确定参数时加 `--help`。
@@ -110,11 +131,34 @@ yuque doc   https://nova.yuque.com/ghxd00/mrge27/bbf1n662v36gd85q --json
 以下三种都可以：
 
 ```bash
-yuque doc https://nova.yuque.com/ghxd00/mrge27/bbf1n662v36gd85q
-yuque doc ghxd00/mrge27/bbf1n662v36gd85q
-yuque doc bbf1n662v36gd85q --repo ghxd00/mrge27
+yuque doc get https://nova.yuque.com/ghxd00/mrge27/bbf1n662v36gd85q
+yuque doc get ghxd00/mrge27/bbf1n662v36gd85q
+yuque doc get bbf1n662v36gd85q --repo ghxd00/mrge27
 yuque docs --repo 79635820          # 也可以直接给知识库数字 id
 ```
+
+### 写文档（写权限）
+
+```bash
+# 建文档并自动挂到目录根
+uv run yuque doc create --repo ghxd00/ruargs -t "[示例] 申请模板" -f template.md
+
+# 建分组节点，再把它下面挂子文档
+uv run yuque toc add  --repo ghxd00/ruargs --type TITLE -t "2026 秋 教室申请" --json
+uv run yuque doc create --repo ghxd00/ruargs -t "张三-周三 7-8 节" -f a.md --parent <分组 uuid>
+
+# 改 / 删
+uv run yuque doc update ghxd00/ruargs/<slug> -f a-v2.md
+uv run yuque doc delete ghxd00/ruargs/<slug> --yes
+
+# 任何写操作都可以先 --dry-run 看将要发送什么
+uv run yuque doc create --repo ghxd00/ruargs -t X -f a.md --dry-run
+```
+
+> ⚠️ **目录是写后延迟的**：`toc add` 之后立刻 `toc list` 可能看不到新节点，
+> 等几秒再查，不要据此判定失败并重试（会重复挂载）。
+> ⚠️ `doc delete` / `repo delete` / `toc remove` 必须显式 `--yes`；
+> `repo delete` 会连带删除知识库里所有文档。
 
 ### 读语雀表格
 

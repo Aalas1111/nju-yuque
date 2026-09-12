@@ -13,6 +13,8 @@ from nju_yuque.session import (
     Credentials,
     clear,
     parse_cookie_string,
+    scope_allows_write,
+    write_kinds,
 )
 
 
@@ -66,3 +68,23 @@ def test_clear(tmp_path: Path) -> None:
     path.write_text("{}", encoding="utf-8")
     assert clear(path) is True
     assert clear(path) is False
+
+
+def test_scope_allows_write() -> None:
+    read_only = "group:read,repo:read,doc:read,statistic:read,private_search"
+    assert scope_allows_write(read_only, "doc") is False
+    assert scope_allows_write(read_only, "repo") is False
+
+    writable = "group,repo,doc,statistic:read,private_search"
+    assert scope_allows_write(writable, "doc") is True
+    assert scope_allows_write(writable, "repo") is True
+    assert scope_allows_write(writable, "statistic") is False
+
+    assert scope_allows_write("doc:write", "doc") is True
+    assert scope_allows_write("", "doc") is False
+    assert scope_allows_write("docextra:read", "doc") is False
+
+
+def test_write_kinds() -> None:
+    assert write_kinds("group,repo,doc,statistic:read") == ["doc", "repo", "group"]
+    assert write_kinds("group:read,repo:read,doc:read") == []

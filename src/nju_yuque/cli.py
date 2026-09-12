@@ -21,10 +21,10 @@ from rich.table import Table
 from . import __version__, auth, lakesheet
 from . import config as config_mod
 from .api import YuqueApi
-from .errors import NotLoggedInError, WrongModeError, YuqueError
+from .errors import InsufficientScopeError, NotLoggedInError, WrongModeError, YuqueError
 from .models import Doc, Member, Repo, as_dict
-from .session import Credentials
-from .urls import Target, parse_target, resolve_doc
+from .session import Credentials, scope_allows_write
+from .urls import Target, parse_target, resolve_doc, resolve_repo
 from .web import YuqueWeb
 
 # Windows 控制台默认 GBK，会导致中文乱码；强制 UTF-8 输出。
@@ -42,8 +42,14 @@ app = typer.Typer(
 )
 comment_app = typer.Typer(no_args_is_help=True, help="文档评论：查看 / 新增（需要 Cookie 模式）")
 skill_app = typer.Typer(no_args_is_help=True, help="内置 AI Skill：查看 / 安装")
+doc_app = typer.Typer(no_args_is_help=True, help="文档：读 / 建 / 改 / 删（写操作需写权限令牌）")
+toc_app = typer.Typer(no_args_is_help=True, help="目录：查看 / 挂载 / 移除")
+repo_app = typer.Typer(no_args_is_help=True, help="知识库：创建 / 删除")
 app.add_typer(comment_app, name="comment")
 app.add_typer(skill_app, name="skill")
+app.add_typer(doc_app, name="doc")
+app.add_typer(toc_app, name="toc")
+app.add_typer(repo_app, name="repo")
 
 # rich 在 Windows 的 legacy console 下会直接调 Win32 API，管道被关闭时（如 `| head`）
 # 会抛 OSError(22)；关掉 legacy 渲染后走普通流写入，BrokenPipe 可被 rich 正常处理。
@@ -176,10 +182,9 @@ def _fetch_doc(cred: Credentials, target: Target, repo_option: str | None) -> Do
 def _capabilities(cred: Credentials) -> dict[str, bool]:
     """根据登录模式推断能力边界（供 skill / doctor 使用）。"""
     if cred.is_token:
-        scopes = {s.strip() for s in (cred.scopes or "").split(",") if s.strip()}
         return {
             "read": True,
-            "write": any("write" in s for s in scopes),
+            "write": any(scope_allows_write(cred.scopes, k) for k in ("doc", "repo")),
             "comment": False,  # 官方接口没有评论能力
         }
     return {
@@ -355,8 +360,89 @@ def repos(
     console.print(table)
 
 
-@app.command()
-def toc(
+# ---------------------------------------------------------------- 知识库管理
+@repo_app.command("create")
+def repo_create(
+    name: str = typer.Option(..., "--name", "-n", help="知识库名称"),
+    slug: str | None = typer.Option(None, "--slug", help="路径（不填自动生成）"),
+    description: str | None = typer.Option(None, "--description", "-d", help="简介"),
+    public: int = typer.Option(2, "--public", help="0 私密 / 1 公开 / 2 企业内公开"),
+    group: str | None = typer.Option(None, "--group", help="团队 login（默认用登录时的）"),
+    enhanced_privacy: bool = typer.Option(False, "--enhanced-privacy", help="对团队成员也隐藏"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只打印将要创建的内容"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
+    """新建知识库。"""
+    cred = _creds()
+    _require_write(cred, "repo")
+    target_slug = slug or _random_slug()
+    if dry_run:
+        _dump(
+            {
+                "group": group or cred.group,
+                "name": name,
+                "slug": target_slug,
+                "public": public,
+                "description": description,
+            }
+        )
+        return
+    try:
+        with _api(cred) as api:
+            repo = api.create_repo(
+                name=name,
+                slug=target_slug,
+                group=group,
+                description=description,
+                public=public,
+                enhanced_privacy=enhanced_privacy,
+            )
+    except YuqueError as exc:
+        _fail(exc)
+    _dump(repo) if json_out else console.print(
+        f"[green]✓[/green] 已创建知识库 #{repo.id} {repo.name}  {repo.namespace}"
+    )
+
+
+@repo_app.command("delete")
+def repo_delete(
+    repo: str = typer.Option(..., "--repo", help="知识库 id 或 group/slug"),
+    yes: bool = typer.Option(False, "--yes", help="确认删除（不可逆，必须显式加）"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
+    """删除知识库（默认拒绝执行，需 --yes）。"""
+    cred = _creds()
+    _require_write(cred, "repo")
+    try:
+        with _api(cred) as api:
+            info = api.repo(repo)
+            if not yes:
+                _fail(
+                    WrongModeError(
+                        f"将删除知识库 #{info.id}《{info.name}》（{info.items_count} 篇文档）——不可逆。"
+                        "确认后请重跑并加 --yes"
+                    ),
+                    2,
+                )
+            deleted = api.delete_repo(repo)
+    except YuqueError as exc:
+        _fail(exc)
+    _dump(deleted) if json_out else console.print(
+        f"[green]✓[/green] 已删除知识库 #{deleted.id} {deleted.name}"
+    )
+
+
+def _random_slug() -> str:
+    """语雀风格的 6 位小写字母数字 slug。"""
+    import secrets
+    import string
+
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(6))
+
+
+@toc_app.command("list")
+def toc_list(
     repo: str = typer.Option(..., "--repo", help="知识库 id 或 group/slug"),
     json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
 ) -> None:
@@ -364,8 +450,11 @@ def toc(
     cred = _creds()
     if not cred.is_token:
         _fail(WrongModeError("目录树目前只在令牌模式可用（官方 /toc 接口）"), 2)
-    with _api(cred) as api:
-        items = api.toc(repo)
+    try:
+        with _api(cred) as api:
+            items = api.toc(repo)
+    except YuqueError as exc:
+        _fail(exc)
     if json_out:
         _dump(items)
         return
@@ -373,6 +462,69 @@ def toc(
         _plain(
             f"{'  ' * item.depth}[{item.type}] {item.title}" + (f"  {item.url}" if item.url else "")
         )
+
+
+@toc_app.command("add")
+def toc_add(
+    repo: str = typer.Option(..., "--repo", help="知识库 id 或 group/slug"),
+    doc_id: list[int] | None = typer.Option(None, "--doc-id", help="要挂载的文档 id（可重复）"),
+    title: str | None = typer.Option(None, "--title", "-t", help="分组标题（建 TITLE 节点时用）"),
+    type: str = typer.Option("DOC", "--type", help="节点类型 DOC / TITLE"),
+    parent: str | None = typer.Option(None, "--parent", help="父节点 UUID（不填挂根）"),
+    prepend: bool = typer.Option(False, "--prepend", help="头插而不是尾插"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
+    """把文档 / 分组挂到知识库目录（官方接口建文档不会自动入目录）。"""
+    cred = _creds()
+    _require_write(cred, "doc")
+    node_type = type.upper()
+    if node_type == "DOC" and not doc_id:
+        _fail(WrongModeError("挂载文档需要 --doc-id（可重复传多个）"), 2)
+    if node_type == "TITLE" and not title:
+        _fail(WrongModeError("创建分组节点需要 --title"), 2)
+    try:
+        with _api(cred) as api:
+            items = api.toc_add(
+                repo,
+                doc_ids=list(doc_id) if doc_id else None,
+                title=title,
+                node_type=node_type,
+                target_uuid=parent,
+                prepend=prepend,
+            )
+    except YuqueError as exc:
+        _fail(exc)
+    if json_out:
+        _dump(items)
+        return
+    for item in items:
+        _plain(f"[{item.type}] {item.title}  uuid={item.uuid}")
+
+
+@toc_app.command("remove")
+def toc_remove(
+    repo: str = typer.Option(..., "--repo", help="知识库 id 或 group/slug"),
+    node_uuid: str = typer.Option(..., "--node-uuid", help="要移除的目录节点 UUID"),
+    with_children: bool = typer.Option(False, "--with-children", help="连同子节点一起移除"),
+    yes: bool = typer.Option(False, "--yes", help="确认移除（不会删除关联文档，但必须显式加）"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
+    """从目录里移除节点（**不删除文档**）。"""
+    cred = _creds()
+    _require_write(cred, "doc")
+    if not yes:
+        _fail(
+            WrongModeError(f"将从目录移除节点 {node_uuid}（文档保留）。确认后请重跑并加 --yes"), 2
+        )
+    try:
+        with _api(cred) as api:
+            items = api.toc_remove(repo, node_uuid=node_uuid, with_children=with_children)
+    except YuqueError as exc:
+        _fail(exc)
+    if json_out:
+        _dump(items)
+        return
+    _plain(f"已移除节点 {node_uuid}，目录现有 {len(items)} 项")
 
 
 def _plain(line: str = "") -> None:
@@ -433,8 +585,8 @@ def search(
         _plain(f"    {item.get('url') or ''}")
 
 
-@app.command()
-def doc(
+@doc_app.command("get")
+def doc_get(
     target: str = typer.Argument(..., help="文档链接 / group/book/slug / slug"),
     repo: str | None = typer.Option(
         None, "--repo", help="知识库 id 或 group/slug（target 是裸 slug 时必填）"
@@ -466,6 +618,171 @@ def doc(
     console.print(f"# {item.title}")
     console.print(f"# slug={item.slug} format={item.format} updated={item.updated_at}")
     console.print(body[:max_chars])
+
+
+# ---------------------------------------------------------------- 写操作（需要写权限令牌）
+def _require_write(cred: Credentials, kind: str = "doc") -> None:
+    """写操作前的能力检查；scope 未知时不阻断，让服务端给出确切错误。"""
+    if not cred.is_token:
+        _fail(
+            WrongModeError("写操作走官方 API，需要令牌模式：`yuque login --token <写权限令牌>`"),
+            2,
+        )
+    scopes = {s.strip() for s in (cred.scopes or "").split(",") if s.strip()}
+    if not scopes:
+        return
+    if not scope_allows_write(cred.scopes, kind):
+        _fail(
+            InsufficientScopeError(
+                f"当前令牌没有 {kind} 写权限（scope={cred.scopes}）；请换带写权限的令牌"
+            ),
+            2,
+        )
+
+
+def _read_text(body: str | None, file: Path | None) -> str:
+    """正文来源：--body / --file / stdin 三选一。"""
+    if file:
+        return file.read_text(encoding="utf-8")
+    if body is not None:
+        return body
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    _fail(WrongModeError("正文为空：请传 --body、--file，或用管道从 stdin 输入"), 2)
+
+
+def _resolve_repo_or_fail(cred: Credentials, target: Target, repo_option: str | None) -> str:
+    try:
+        return resolve_repo(target, repo_option, cred.group)
+    except ValueError as exc:
+        _fail(exc, 2)
+
+
+@doc_app.command("create")
+def doc_create(
+    title: str = typer.Option(..., "--title", "-t", help="文档标题"),
+    repo: str = typer.Option(..., "--repo", help="知识库 id 或 group/slug"),
+    body: str | None = typer.Option(None, "--body", "-b", help="正文（Markdown）"),
+    file: Path | None = typer.Option(None, "--file", "-f", help="从文件读取正文"),
+    slug: str | None = typer.Option(None, "--slug", help="文档路径（不填由语雀生成）"),
+    public: int | None = typer.Option(
+        None, "--public", help="公开性 0 私密 / 1 公开 / 2 企业内公开"
+    ),
+    no_toc: bool = typer.Option(False, "--no-toc", help="不自动挂到目录"),
+    parent: str | None = typer.Option(
+        None, "--parent", help="挂到该目录节点的 UUID 下（默认挂根）"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只打印将要发送的内容"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
+    """新建文档（默认同时挂到知识库目录）。"""
+    cred = _creds()
+    _require_write(cred, "doc")
+    content = _read_text(body, file)
+    plan = {
+        "repo": repo,
+        "title": title,
+        "slug": slug,
+        "public": public,
+        "bytes": len(content.encode("utf-8")),
+        "toc": not no_toc,
+        "parent": parent,
+    }
+    if dry_run:
+        _dump({**plan, "body_head": content[:500]})
+        return
+    try:
+        with _api(cred) as api:
+            item = api.create_doc(repo, title=title, body=content, slug=slug, public=public)
+            if not no_toc:
+                try:
+                    api.toc_add(repo, doc_ids=[item.id], target_uuid=parent)
+                except YuqueError as exc:
+                    err_console.print(f"[yellow]文档已创建，但挂载目录失败：{exc}[/yellow]")
+    except YuqueError as exc:
+        _fail(exc)
+    _dump(item) if json_out else console.print(
+        f"[green]✓[/green] 已创建 #{item.id} {item.title}  slug={item.slug}"
+    )
+
+
+@doc_app.command("update")
+def doc_update(
+    target: str = typer.Argument(..., help="文档链接 / slug"),
+    repo: str | None = typer.Option(None, "--repo", help="知识库 id 或 group/slug"),
+    title: str | None = typer.Option(None, "--title", "-t", help="新标题"),
+    body: str | None = typer.Option(None, "--body", "-b", help="新正文（Markdown）"),
+    file: Path | None = typer.Option(None, "--file", "-f", help="从文件读取新正文"),
+    public: int | None = typer.Option(None, "--public", help="公开性"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只打印将要发送的内容"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
+    """更新文档（只改传入的字段）。"""
+    cred = _creds()
+    _require_write(cred, "doc")
+    parsed = parse_target(target)
+    repo_name = _resolve_repo_or_fail(cred, parsed, repo)
+    new_body = _read_text(body, file) if (body is not None or file) else None
+    if title is None and new_body is None and public is None:
+        _fail(WrongModeError("没有任何要更新的字段：请传 --title / --body / --file / --public"), 2)
+    if dry_run:
+        _dump(
+            {
+                "repo": repo_name,
+                "target": target,
+                "title": title,
+                "public": public,
+                "bytes": len(new_body.encode("utf-8")) if new_body else 0,
+            }
+        )
+        return
+    try:
+        with _api(cred) as api:
+            doc_id = api.doc(repo_name, parsed.slug).id if parsed.slug else None
+            if not doc_id:
+                _fail(WrongModeError("需要文档链接或 slug 来定位文档"), 2)
+            item = api.update_doc(repo_name, doc_id, title=title, body=new_body, public=public)
+    except YuqueError as exc:
+        _fail(exc)
+    _dump(item) if json_out else console.print(
+        f"[green]✓[/green] 已更新 #{item.id} {item.title}  updated={item.updated_at}"
+    )
+
+
+@doc_app.command("delete")
+def doc_delete(
+    target: str = typer.Argument(..., help="文档链接 / slug"),
+    repo: str | None = typer.Option(None, "--repo", help="知识库 id 或 group/slug"),
+    yes: bool = typer.Option(False, "--yes", help="确认删除（不可逆，必须显式加）"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只打印将要删除的对象"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
+    """删除文档（默认拒绝执行，需 --yes）。"""
+    cred = _creds()
+    _require_write(cred, "doc")
+    parsed = parse_target(target)
+    repo_name = _resolve_repo_or_fail(cred, parsed, repo)
+    try:
+        with _api(cred) as api:
+            item = api.doc(repo_name, parsed.slug) if parsed.slug else None
+            if item is None:
+                _fail(WrongModeError("需要文档链接或 slug 来定位文档"), 2)
+            if dry_run:
+                _dump({"would_delete": as_dict(item)})
+                return
+            if not yes:
+                _fail(
+                    WrongModeError(
+                        f"将删除 #{item.id}《{item.title}》——不可逆。确认后请重跑并加 --yes"
+                    ),
+                    2,
+                )
+            deleted = api.delete_doc(repo_name, item.id)
+    except YuqueError as exc:
+        _fail(exc)
+    _dump(deleted) if json_out else console.print(
+        f"[green]✓[/green] 已删除 #{deleted.id} {deleted.title}"
+    )
 
 
 @app.command()
@@ -676,8 +993,10 @@ def main() -> None:
     """console_scripts 入口：把语雀异常翻译成友好输出。"""
     try:
         app()
-    except YuqueError as exc:  # pragma: no cover - 顶层兜底
-        _fail(exc)
+    except YuqueError as exc:  # 顶层兜底
+        # 不能用 _fail（它在 except 里 raise typer.Exit，会造成异常链并打 traceback）
+        err_console.print(f"[red]✗ {exc}[/red]")
+        raise SystemExit(1) from None
     except (BrokenPipeError, OSError) as exc:  # `yuque ... | head` 之类的正常收尾
         # Windows 下管道被上游关闭时表现为 OSError(22/EINVAL) 而不是 BrokenPipeError。
         if isinstance(exc, OSError) and exc.errno not in (None, 22, 32):

@@ -67,6 +67,12 @@ class TocItem(_Base):
         """语雀对 TITLE 项会返回空字符串，这里统一成 None。"""
         return None if value is None or value == "" else value
 
+    @field_validator("url", "slug", "parent_uuid", "child_uuid", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: object) -> object:
+        """根节点的 parent_uuid 会是 null，统一成空串。"""
+        return "" if value is None else value
+
 
 class Sheet(_Base):
     """解码后的表格页。"""

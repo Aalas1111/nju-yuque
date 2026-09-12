@@ -45,9 +45,21 @@ class YuqueApi:
         self.close()
 
     # -- 底层请求 ---------------------------------------------------------
-    def _get_payload(self, path: str, **params: Any) -> Any:
-        """发一次 GET，返回语雀原始响应体（不拆 ``data``）。"""
-        resp = self.client.get(path, params={k: v for k, v in params.items() if v is not None})
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any | None = None,
+    ) -> Any:
+        """发一次请求，返回语雀原始响应体（不拆 ``data``）。"""
+        resp = self.client.request(
+            method,
+            path,
+            params={k: v for k, v in (params or {}).items() if v is not None},
+            json=json_body,
+        )
         scopes = resp.headers.get("x-oauth-scopes")
         if scopes:
             self.scopes = scopes
@@ -61,9 +73,15 @@ class YuqueApi:
             raise_for_status(resp.status_code, message)
         return resp.json()
 
-    def _get(self, path: str, **params: Any) -> Any:
-        payload = self._get_payload(path, **params)
+    def _get_payload(self, path: str, **params: Any) -> Any:
+        return self._request("GET", path, params=params)
+
+    @staticmethod
+    def _unwrap(payload: Any) -> Any:
         return payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+
+    def _get(self, path: str, **params: Any) -> Any:
+        return self._unwrap(self._get_payload(path, **params))
 
     # -- 身份 / 自检 ------------------------------------------------------
     def hello(self) -> str:
@@ -118,6 +136,160 @@ class YuqueApi:
     def doc_versions(self, doc_id: int) -> list[dict[str, Any]]:
         data = self._get("/api/v2/doc_versions", doc_id=doc_id)
         return data if isinstance(data, list) else []
+
+    # -- 写：能力判断 -----------------------------------------------------
+    @property
+    def scopes_set(self) -> set[str]:
+        return {s.strip() for s in (self.scopes or "").split(",") if s.strip()}
+
+    def can_write(self, kind: str = "doc") -> bool:
+        """令牌是否具备某类对象的写权限。"""
+        from .session import scope_allows_write
+
+        return scope_allows_write(self.scopes, kind)
+
+    # -- 写：文档 ---------------------------------------------------------
+    def create_doc(
+        self,
+        repo: str,
+        *,
+        title: str,
+        body: str,
+        slug: str | None = None,
+        public: int | None = None,
+        format: str = "markdown",  # noqa: A002 - 对齐语雀字段名
+    ) -> Doc:
+        payload: dict[str, Any] = {"title": title, "body": body, "format": format}
+        if slug:
+            payload["slug"] = slug
+        if public is not None:
+            payload["public"] = public
+        data = self._unwrap(self._request("POST", f"/api/v2/repos/{repo}/docs", json_body=payload))
+        return Doc.model_validate(data)
+
+    def update_doc(
+        self,
+        repo: str,
+        doc_id: int | str,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        slug: str | None = None,
+        public: int | None = None,
+        format: str = "markdown",  # noqa: A002
+    ) -> Doc:
+        payload: dict[str, Any] = {"format": format}
+        if title is not None:
+            payload["title"] = title
+        if body is not None:
+            payload["body"] = body
+        if slug is not None:
+            payload["slug"] = slug
+        if public is not None:
+            payload["public"] = public
+        data = self._unwrap(
+            self._request("PUT", f"/api/v2/repos/{repo}/docs/{doc_id}", json_body=payload)
+        )
+        return Doc.model_validate(data)
+
+    def delete_doc(self, repo: str, doc_id: int | str) -> Doc:
+        data = self._unwrap(self._request("DELETE", f"/api/v2/repos/{repo}/docs/{doc_id}"))
+        return Doc.model_validate(data)
+
+    # -- 写：知识库 -------------------------------------------------------
+    def create_repo(
+        self,
+        *,
+        name: str,
+        slug: str,
+        group: str | None = None,
+        description: str | None = None,
+        public: int = 2,
+        enhanced_privacy: bool = False,
+    ) -> Repo:
+        login = group or self.group
+        payload: dict[str, Any] = {"name": name, "slug": slug, "public": public}
+        if description is not None:
+            payload["description"] = description
+        if enhanced_privacy:
+            payload["enhancedPrivacy"] = True
+        data = self._unwrap(
+            self._request("POST", f"/api/v2/groups/{login}/repos", json_body=payload)
+        )
+        return Repo.model_validate(data)
+
+    def delete_repo(self, repo: str) -> Repo:
+        data = self._unwrap(self._request("DELETE", f"/api/v2/repos/{repo}"))
+        return Repo.model_validate(data)
+
+    # -- 写：目录 ---------------------------------------------------------
+    def toc_add(
+        self,
+        repo: str,
+        *,
+        doc_ids: list[int] | None = None,
+        title: str | None = None,
+        node_type: str = "DOC",
+        target_uuid: str | None = None,
+        url: str | None = None,
+        prepend: bool = False,
+    ) -> list[TocItem]:
+        """把新建的文档 / 分组标题 / 外链挂到目录（默认尾巴追加）。
+
+        实测：``action_mode`` 必须用 ``child``（无 ``target_uuid`` 时即挂在根下）；
+        ``sibling`` 在带 ``target_uuid`` 时不生效。另注意目录读取有写后延迟（秒级）。
+        """
+        payload: dict[str, Any] = {
+            "action": "prependNode" if prepend else "appendNode",
+            "action_mode": "child",
+            "type": node_type,
+        }
+        if doc_ids:
+            payload["doc_ids"] = doc_ids
+        if title:
+            payload["title"] = title
+        if url:
+            payload["url"] = url
+            payload["open_window"] = 0
+        if target_uuid:
+            payload["target_uuid"] = target_uuid
+        data = self._unwrap(self._request("PUT", f"/api/v2/repos/{repo}/toc", json_body=payload))
+        return [TocItem.model_validate(x) for x in (data or [])]
+
+    def toc_remove(
+        self, repo: str, *, node_uuid: str, with_children: bool = False
+    ) -> list[TocItem]:
+        payload = {
+            "action": "removeNode",
+            "action_mode": "child" if with_children else "sibling",
+            "node_uuid": node_uuid,
+        }
+        data = self._unwrap(self._request("PUT", f"/api/v2/repos/{repo}/toc", json_body=payload))
+        return [TocItem.model_validate(x) for x in (data or [])]
+
+    def toc_edit(
+        self,
+        repo: str,
+        *,
+        node_uuid: str,
+        title: str | None = None,
+        url: str | None = None,
+        open_window: bool | None = None,
+    ) -> list[TocItem]:
+        payload: dict[str, Any] = {
+            "action": "editNode",
+            "action_mode": "sibling",
+            "node_uuid": node_uuid,
+        }
+        if title is not None:
+            payload["title"] = title
+        if url is not None:
+            payload["url"] = url
+            payload["type"] = "LINK"
+        if open_window is not None:
+            payload["open_window"] = 1 if open_window else 0
+        data = self._unwrap(self._request("PUT", f"/api/v2/repos/{repo}/toc", json_body=payload))
+        return [TocItem.model_validate(x) for x in (data or [])]
 
     def search(
         self,
