@@ -41,6 +41,8 @@ class Doc(_Base):
     content_updated_at: str | None = None
     body: str | None = None
     description: str | None = None
+    # 创作者（列表接口可能缺失，详情接口一定有）；用于「申请人」缺失时回退
+    creator: dict[str, Any] | None = None
 
     @property
     def is_sheet(self) -> bool:

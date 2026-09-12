@@ -1,24 +1,30 @@
 """教室借用申请 · 知识库自动维护 agent（单库版）
 
-做四件事：
+设计原则：**这是一个 agent，不是死程序。** 对每份文档先判断它属于哪一档：
 
-1. **审核**：读取申请文档，按《指导文档》的规则校验（状态/必填/48h/节次/人数）；
-2. **整理结构**：文档放错位置但能判断归属 → 移动到对应的周目录；无法识别 → 删除；
-3. **审批日志**：在申请文档下维护一份子文档 `审批日志`，追加时间戳 + 结论 + 意见；
-4. **归档**：把过期的周目录移动到 `99-归档`。
+| 档位 | 判断 | 动作 |
+|---|---|---|
+| 合规 | 字段齐全、时间/日期/校区能直接对上 | 规范化 → 提交 → 写审批日志 |
+| 可处理为合规 | 写法不标准（`9月16日`、`下午4点-6点`、`仙林校区`）、\n|            | 可选字段缺失、申请人可由文档创建者推断 | 自动规范化后按合规处理，日志注明改了什么 |
+| 绝对不合规 | 超期 / 撞吃饭时间 / 对不上节次 / 关键信息缺失且推断不出 | 状态改「已退回」，日志写原因 |
+| 不像申请 | 没用模板且提取不到「日期+时间+校区」 | 删除 |
 
-默认 **dry-run**（只打印计划，不动数据）；加 `--apply` 才真正执行。
+agent 会自动生成提交所需的**借用节次**（由活动时间推算）、校区代码等。
+
+默认 **dry-run**；`--apply` 才真正写。
 
 用法::
 
-    export YUQUE_HOME=~/.yuque           # 或任一已登录的目录
-    uv run python examples/classroom_application_agent.py --repo lqogh0/jsjysq
-    uv run python examples/classroom_application_agent.py --repo lqogh0/jsjysq --apply
+    export YUQUE_HOME=~/.yuque
+    uv run python examples/classroom_application_agent.py --repo <group/slug>
+    uv run python examples/classroom_application_agent.py --repo <group/slug> --apply
+    uv run python examples/classroom_application_agent.py --repo <group/slug> --approve "<标题或slug>"
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -26,58 +32,73 @@ from datetime import datetime, timedelta, timezone
 
 from nju_yuque.api import YuqueApi
 from nju_yuque.errors import YuqueError
+from nju_yuque.models import Doc
 from nju_yuque.session import Credentials
 
-# ---------------------------------------------------------------- 规则常量
+# ---------------------------------------------------------------- 知识库约定
 GUIDE_TITLE = "00-指导文档（必读）"
-TEMPLATE_TITLE = "教室申请模板（复制后填写）"
 LOG_TITLE = "审批日志"  # 申请文档下由 agent 维护的子文档
 ARCHIVE_TITLE = "归档区"
 # 周目录命名：0914-0920（MMDD-MMDD），后面允许跟任意说明文字
 WEEK_TITLE_RE = re.compile(r"^(\d{2})(\d{2})\s*[-~～]\s*(\d{2})(\d{2})")
 
-# 状态机（agent 会改写文档首行的「状态」）
-STATUS_PENDING = "待提交"  # 社员写，等 agent 校验
-STATUS_SUBMITTED = "已提交（待审核通过）"  # agent 写，已提交学校系统
-STATUS_APPROVED = "已通过（本文档已归档，禁止再次修改）"  # agent 写，终态
-STATUS_REJECTED = "已退回（修改后请把状态改为待提交）"  # agent 写，等社员改回待提交
-STATUS_RE = re.compile(r"^([ 	>*\-•]*\**\s*状态\s*\**\s*[:：][ 	]*)(.*)$", re.MULTILINE)
+# ---------------------------------------------------------------- 状态机
+STATUS_PENDING = "待提交"
+STATUS_SUBMITTED = "已提交（待审核通过）"
+STATUS_APPROVED = "已通过（本文档已归档，禁止再次修改）"
+STATUS_REJECTED = "已退回（修改后请把状态改为待提交）"
+STATUS_RE = re.compile(r"^([ \t>*\-•]*\**\s*状态\s*\**\s*[:：][ \t]*)(.*)$", re.MULTILINE)
 
-ADVANCE_HOURS = 48  # 必须提前 48 小时
+# ---------------------------------------------------------------- 业务规则
+ADVANCE_HOURS = 48  # 提前量
+DAY_START, DAY_END = 8 * 60, 22 * 60 + 20  # 可申请时段 08:00 - 22:20
+LUNCH_START, LUNCH_END = 12 * 60, 14 * 60  # 吃饭时间，不可重叠
 
-PERIOD_START = {
-    1: "08:00",
-    2: "09:00",
-    3: "10:10",
-    4: "11:10",
-    5: "14:00",
-    6: "15:00",
-    7: "16:10",
-    8: "17:10",
-    9: "18:30",
-    10: "19:30",
-    11: "20:30",
-    12: "21:30",
+# 节次：(第几节, 开始分钟, 结束分钟)
+PERIODS: list[tuple[int, int, int]] = [
+    (1, 480, 530),
+    (2, 540, 590),
+    (3, 610, 660),
+    (4, 670, 720),
+    (5, 840, 890),
+    (6, 900, 950),
+    (7, 970, 1020),
+    (8, 1030, 1080),
+    (9, 1110, 1160),
+    (10, 1170, 1220),
+    (11, 1230, 1280),
+    (12, 1290, 1340),
+]
+
+CAMPUSES: dict[str, tuple[str, str]] = {  # 别名 -> (规范名, 学校代码)
+    "鼓楼": ("鼓楼", "1"),
+    "浦口": ("浦口", "2"),
+    "仙林": ("仙林", "3"),
+    "苏州": ("苏州", "4"),
 }
 
-REQUIRED_FIELDS = (
-    "活动名称",
-    "申请人",
-    "真实姓名",
-    "联系方式",
-    "活动日期",
-    "使用节次",
-    "预计人数",
-    "意向教室或教学楼",
-)
+# 提交时的缺省值（社团统一申请，联系人统一用老师电话）
+DEFAULT_CONTACT = os.environ.get("CRB_CONTACT", "13800000000")
+DEFAULT_PEOPLE = 30  # 人数不详时按「足够少，随便借一间」处理
 
 CN = timezone(timedelta(hours=8))
 
+REQUIRED_FIELDS = ("活动名称", "申请人", "活动日期", "活动时间", "校区")
+FILL_FIELDS = ("教学楼", "教室")
+ALL_FIELDS = ("状态", *REQUIRED_FIELDS, *FILL_FIELDS)
+
 FIELD_RE = re.compile(
     # 注意：[ \t] 而不是 \s —— \s 会吃掉换行，导致空值字段把下一行当成自己的值
-    r"^[ \t>*\-•]*\**[ \t]*(状态|活动名称|申请人|真实姓名|联系方式|活动日期|使用节次|"
-    r"预计人数|意向教室或教学楼|活动简介)[ \t]*\**[ \t]*[:：][ \t]*(.*?)[ \t]*$",
+    r"^[ \t>*\-•]*\**[ \t]*(" + "|".join(ALL_FIELDS) + r")[ \t]*\**[ \t]*[:：][ \t]*(.*?)[ \t]*$",
     re.MULTILINE,
+)
+DATE_HINT_RE = re.compile(
+    r"(\d{4}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}|\d{1,2}\s*[-/.月]\s*\d{1,2})"
+)
+TIME_HINT_RE = re.compile(
+    r"(\d{1,2}\s*[:：点时]\s*(?:\d{1,2}|半)?)"
+    r"\s*(?:-|~|～|—|到|至)\s*"
+    r"(\d{1,2}\s*[:：点时]\s*(?:\d{1,2}|半)?)"
 )
 
 
@@ -85,15 +106,22 @@ FIELD_RE = re.compile(
 @dataclass
 class Verdict:
     action: str  # keep / move / delete / skip
+    tier: str = ""  # ok / normalized / rejected / orphan
     target_title: str = ""
     ok: bool = False
     problems: list[str] = field(default_factory=list)
+    fixes: list[str] = field(default_factory=list)
     fields: dict[str, str] = field(default_factory=dict)
+    derived: dict[str, object] = field(default_factory=dict)
     note: str = ""
-    new_status: str = ""  # agent 要写回文档首行的新状态
+    new_status: str = ""
 
 
-# ---------------------------------------------------------------- 写回状态
+# ---------------------------------------------------------------- 规范化
+def _hm(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
 def set_status(body: str, new_status: str) -> str:
     """把文档首行的「状态：xxx」改成新状态；没有这一行就补在开头。"""
     if STATUS_RE.search(body or ""):
@@ -101,114 +129,222 @@ def set_status(body: str, new_status: str) -> str:
     return f"状态：{new_status}\n\n{body or ''}"
 
 
-# ---------------------------------------------------------------- 解析
 def parse_fields(body: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for m in FIELD_RE.finditer(body or ""):
-        key, value = m.group(1), m.group(2).strip()
-        # 去掉 markdown 强调符号与占位符
-        value = value.strip("*_` ").strip()
-        if value in {"", "-", "—", "（必填）", "(必填)"}:
+        value = m.group(2).strip().strip("*_` ").strip()
+        if value in {"", "-", "—", "（必填）", "(必填)", "（可不填）", "(可不填)"}:
             value = ""
-        out.setdefault(key, value)  # 同名取第一次出现
+        out.setdefault(m.group(1), value)
     return out
 
 
-def looks_like_template(fields: dict[str, str]) -> bool:
-    return len(fields) >= 4
-
-
-def parse_date(raw: str, now: datetime) -> datetime | None:
-    """支持 2026-09-16 / 2026-09-16（周三） / 2026/9/16 / 09-16。"""
-    text = raw.strip()
-    m = re.search(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})", text)
+def normalize_date(raw: str, now: datetime) -> tuple[datetime | None, str]:
+    """宽松解析日期，返回 (日期, 规范化说明)。"""
+    text = (raw or "").strip()
+    m = re.search(r"(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})", text)
     if m:
         y, mo, d = (int(x) for x in m.groups())
     else:
-        m = re.search(r"^(\d{1,2})[-/月](\d{1,2})", text)
+        m = re.search(r"(\d{1,2})\s*[-/.月]\s*(\d{1,2})", text)
         if not m:
-            return None
+            return None, ""
         y, mo, d = now.year, int(m.group(1)), int(m.group(2))
     try:
         dt = datetime(y, mo, d, tzinfo=CN)
     except ValueError:
-        return None
-    # 只写了月日且已过去很久 → 视作明年
-    if "年" not in text and dt.date() < (now - timedelta(days=180)).date():
+        return None, ""
+    if dt.date() < (now - timedelta(days=180)).date():  # 只写月日且已过去 → 明年
         try:
             dt = dt.replace(year=y + 1)
         except ValueError:
-            return None
-    return dt
+            return None, ""
+    fix = "" if text.startswith(f"{dt:%Y-%m-%d}") else f"日期「{text}」→ {dt:%Y-%m-%d}"
+    return dt, fix
 
 
-def parse_period(raw: str) -> tuple[int, int] | None:
-    text = raw.strip()
-    m = re.search(r"(\d{1,2})\s*[-~～至到]\s*(\d{1,2})", text)
-    if m:
-        a, b = int(m.group(1)), int(m.group(2))
-    else:
-        m = re.search(r"(\d{1,2})", text)
-        if not m:
-            return None
-        a = b = int(m.group(1))
-    if not (1 <= a <= 12 and 1 <= b <= 12 and a <= b):
-        return None
-    return a, b
-
-
-def parse_people(raw: str) -> int | None:
-    m = re.search(r"(\d+)", raw)
+def _parse_clock(token: str, hint: str) -> int | None:
+    """把 `16:10` / `4点` / `4点半` / `16时20` 解析成分钟。"""
+    m = re.match(r"^(\d{1,2})\s*[:：点时]\s*(\d{0,2})\s*分?\s*(半)?$", token.strip())
     if not m:
         return None
-    n = int(m.group(1))
-    return n if n > 0 else None
+    hour, minute, half = int(m.group(1)), m.group(2), m.group(3)
+    mins = 30 if half else (int(minute) if minute else 0)
+    if hour > 24 or mins >= 60:
+        return None
+    if hint in {"下午", "晚上", "傍晚"} and hour < 12:
+        hour += 12
+    elif hint in {"上午", "早上", "早晨"} and hour == 12:
+        hour = 0
+    elif not hint and 0 < hour <= 7:  # 无提示又只有 1~7 点 → 按下午理解
+        hour += 12
+    return hour * 60 + mins
 
 
-def evaluate(fields: dict[str, str], now: datetime) -> Verdict:
-    problems: list[str] = []
+def normalize_time(raw: str) -> tuple[int | None, int | None, str]:
+    """宽松解析时间段，返回 (开始分钟, 结束分钟, 规范化说明)。"""
+    text = (raw or "").strip()
+    hint = ""
+    m_hint = re.match(r"^(上午|早上|早晨|中午|下午|晚上|傍晚)", text)
+    if m_hint:
+        hint = m_hint.group(1)
+    m = TIME_HINT_RE.search(text)
+    if not m:
+        return None, None, ""
+    start = _parse_clock(m.group(1), hint)
+    end = _parse_clock(m.group(2), hint)
+    if start is None or end is None:
+        return None, None, ""
+    fix = (
+        ""
+        if re.fullmatch(r"\d{2}:\d{2}\s*-\s*\d{2}:\d{2}", text)
+        else (f"时间「{text}」→ {_hm(start)}-{_hm(end)}")
+    )
+    return start, end, fix
+
+
+def normalize_campus(raw: str) -> tuple[str, str, str]:
+    """返回 (规范校区名, 学校代码, 规范化说明)。"""
+    text = (raw or "").strip()
+    for alias, (name, code) in CAMPUSES.items():
+        if alias in text:
+            fix = "" if text == name else f"校区「{text}」→ {name}"
+            return name, code, fix
+    return "", "", ""
+
+
+def derive_periods(start: int, end: int) -> tuple[int, int] | None:
+    """活动时间覆盖了哪些节次；返回 (起始节, 结束节)。"""
+    used = [p for p, ps, pe in PERIODS if min(end, pe) > max(start, ps)]
+    if not used:
+        return None
+    return min(used), max(used)
+
+
+# ---------------------------------------------------------------- 判定
+def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) -> Verdict:
+    """三档判断：ok / normalized / rejected。"""
+    v = Verdict(action="keep", fields=dict(fields))
     status = fields.get("状态", "")
     if status != STATUS_PENDING:
-        return Verdict(
-            action="keep",
-            problems=[],
-            fields=fields,
-            note=f"状态为「{status or '缺失'}」，跳过（只处理「待提交」）",
-        )
+        v.tier = "skip"
+        v.note = f"状态为「{status or '缺失'}」，跳过（只处理「{STATUS_PENDING}」）"
+        return v
 
+    # --- 必填字段：能推断的就推断（agent 的职责） ---
+    if not fields.get("活动名称") and title:
+        v.fields["活动名称"] = title
+        v.fixes.append(f"活动名称缺失 → 用文档标题「{title}」")
+    if not fields.get("申请人") and author:
+        v.fields["申请人"] = author
+        v.fixes.append(f"申请人缺失 → 用文档创建者「{author}」")
     for name in REQUIRED_FIELDS:
-        if not fields.get(name):
-            problems.append(f"「{name}」为空")
+        if not v.fields.get(name):
+            v.problems.append(f"「{name}」为空，且无法推断")
 
-    date = parse_date(fields.get("活动日期", ""), now)
-    period = parse_period(fields.get("使用节次", ""))
-    people = parse_people(fields.get("预计人数", ""))
+    # --- 日期 ---
+    date, date_fix = normalize_date(v.fields.get("活动日期", ""), now)
+    if date_fix:
+        v.fixes.append(date_fix)
+    if date is None:
+        if v.fields.get("活动日期"):
+            v.problems.append(f"「活动日期」无法解析：{v.fields['活动日期']}")
 
-    if fields.get("活动日期") and date is None:
-        problems.append(f"「活动日期」无法解析：{fields['活动日期']}")
-    if fields.get("使用节次") and period is None:
-        problems.append(f"「使用节次」不合法（应为 1~12 或 起-止）：{fields['使用节次']}")
-    if fields.get("预计人数") and people is None:
-        problems.append(f"「预计人数」不是正整数：{fields['预计人数']}")
-
-    start = None
-    if date and period:
-        hh, mm = (int(x) for x in PERIOD_START[period[0]].split(":"))
-        start = date.replace(hour=hh, minute=mm)
-        gap = start - now
-        if gap < timedelta(hours=ADVANCE_HOURS):
-            hours = gap.total_seconds() / 3600
-            problems.append(
-                f"活动开始时间 {start:%Y-%m-%d %H:%M} 距今仅 {hours:.1f} 小时，不足 {ADVANCE_HOURS} 小时"
+    # --- 时间 ---
+    start, end, time_fix = normalize_time(v.fields.get("活动时间", ""))
+    if time_fix:
+        v.fixes.append(time_fix)
+    if start is None or end is None:
+        if v.fields.get("活动时间"):
+            v.problems.append(f"「活动时间」无法解析：{v.fields['活动时间']}")
+        else:
+            v.problems.append("「活动时间」为空")
+    else:
+        if start >= end:
+            v.problems.append(f"活动时间前后颠倒：{_hm(start)}-{_hm(end)}")
+        if start < DAY_START or end > DAY_END:
+            v.problems.append(
+                f"活动时间 {_hm(start)}-{_hm(end)} 超出可申请时段 {_hm(DAY_START)}-{_hm(DAY_END)}"
+            )
+        if start < LUNCH_END and end > LUNCH_START:
+            v.problems.append(
+                f"活动时间 {_hm(start)}-{_hm(end)} 与 {_hm(LUNCH_START)}-{_hm(LUNCH_END)} 吃饭时间重叠"
             )
 
-    return Verdict(
-        action="keep",
-        ok=not problems,
-        problems=problems,
-        fields=fields,
-        target_title=start.strftime("%Y-%m-%d") if start else "",
+    # --- 校区 ---
+    campus, campus_code, campus_fix = normalize_campus(v.fields.get("校区", ""))
+    if campus_fix:
+        v.fixes.append(campus_fix)
+    if not campus and v.fields.get("校区"):
+        v.problems.append(f"「校区」不认识：{v.fields['校区']}（应填 鼓楼/浦口/仙林/苏州）")
+    elif not campus:
+        v.problems.append("「校区」为空（鼓楼/浦口/仙林/苏州）")
+
+    # --- 节次推算 ---
+    if start is not None and end is not None and not v.problems:
+        # 不做「对齐到整点/半点」—— 节次本来就是 08:00 / 10:10 / 16:10 / 18:30 这种不规则起点
+        periods = derive_periods(start, end)
+        if periods is None:
+            v.problems.append(
+                f"活动时间 {_hm(start)}-{_hm(end)} 对不上任何节次（它是两节课之间的空档）"
+            )
+        else:
+            ksjc, jsjc = periods
+            v.derived = {
+                "日期": f"{date:%Y-%m-%d}" if date else "",
+                "开始": _hm(start),
+                "结束": _hm(end),
+                "借用节次": f"{ksjc}-{jsjc}" if ksjc != jsjc else str(ksjc),
+                "KSJC": ksjc,
+                "JSJC": jsjc,
+                "校区": campus,
+                "XXXQDM": campus_code,
+                "教学楼": v.fields.get("教学楼") or "(随机)",
+                "教室": v.fields.get("教室") or "(随机)",
+                "人数": DEFAULT_PEOPLE,
+                "联系电话": DEFAULT_CONTACT,
+            }
+            # --- 提前 48 小时 ---
+            if date is not None:
+                act_start = date.replace(hour=start // 60, minute=start % 60)
+                gap = act_start - now
+                if gap < timedelta(hours=ADVANCE_HOURS):
+                    hours = gap.total_seconds() / 3600
+                    v.problems.append(
+                        f"活动开始时间 {act_start:%Y-%m-%d %H:%M} 距现在仅 {hours:.1f} 小时，"
+                        f"不足 {ADVANCE_HOURS} 小时"
+                    )
+
+    v.ok = not v.problems
+    v.tier = "rejected" if v.problems else ("normalized" if v.fixes else "ok")
+    v.new_status = STATUS_SUBMITTED if v.ok else STATUS_REJECTED
+    return v
+
+
+def salvage(body: str, *, title: str, author: str, now: datetime) -> Verdict | None:
+    """没用模板的文档：试着从中提取「日期 + 时间 + 校区」，能提取就当申请处理。"""
+    text = body or ""
+    date, _ = normalize_date(
+        DATE_HINT_RE.search(text).group(1) if DATE_HINT_RE.search(text) else "", now
     )
+    start, end, _ = normalize_time(
+        TIME_HINT_RE.search(text).group(0) if TIME_HINT_RE.search(text) else ""
+    )
+    campus, _, _ = normalize_campus(text)
+    if not (date and start is not None and campus):
+        return None
+    fields = {
+        "状态": STATUS_PENDING,
+        "活动名称": title,
+        "申请人": author,
+        "活动日期": f"{date:%Y-%m-%d}",
+        "活动时间": f"{_hm(start)}-{_hm(end)}",
+        "校区": campus,
+    }
+    v = evaluate(fields, title=title, author=author, now=now)
+    v.fixes.insert(0, "未使用模板，但正文里能提取到日期/时间/校区 → 已按申请处理")
+    v.tier = "normalized"
+    return v
 
 
 # ---------------------------------------------------------------- 知识库操作
@@ -224,11 +360,18 @@ class Kb:
     def close(self) -> None:
         self.api.close()
 
-    # -- 目录 ---------------------------------------------------------
+    # -- 读 -----------------------------------------------------------
     def toc(self) -> list:
         return self.api.toc(self.repo)
 
-    def node_path(self, items: list) -> dict[str, list[str]]:
+    def docs(self) -> list[Doc]:
+        return self.api.docs(self.repo)
+
+    def read(self, doc_id: int) -> Doc:
+        return self.api.doc(self.repo, str(doc_id))
+
+    @staticmethod
+    def node_path(items: list) -> dict[str, list[str]]:
         by_uuid = {i.uuid: i for i in items}
         out: dict[str, list[str]] = {}
         for item in items:
@@ -239,12 +382,14 @@ class Kb:
             out[item.uuid] = list(reversed(chain))
         return out
 
-    def docs(self) -> list:
-        return self.api.docs(self.repo)
-
-    def read(self, doc_id: int) -> str:
-        d = self.api.doc(self.repo, str(doc_id))
-        return d.body or ""
+    def find_log(self, app_node_uuid: str) -> Doc | None:
+        """找申请文档下已有的「审批日志」子文档。"""
+        items = self.toc()
+        for item in items:
+            if item.title != LOG_TITLE or item.parent_uuid != app_node_uuid:
+                continue
+            return next((d for d in self.docs() if d.id == item.doc_id), None)
+        return None
 
     # -- 写 -----------------------------------------------------------
     def move(self, node_uuid: str, parent_uuid: str) -> None:
@@ -256,45 +401,58 @@ class Kb:
     def delete(self, doc_id: int) -> None:
         self.api.delete_doc(self.repo, doc_id)
 
-    def append_log(self, app_doc, log_doc, parent_node_uuid: str, verdict: Verdict) -> str:
-        """在申请文档下维护/追加「审批日志」。返回写进去的正文片段。"""
+    def set_status(self, doc: Doc, status: str) -> None:
+        self.api.update_doc(
+            self.repo, doc.id, body=set_status(self.read(doc.id).body or "", status)
+        )
+
+    def write_log(self, app: Doc, app_node_uuid: str, v: Verdict) -> None:
+        """维护/追加「审批日志」。"""
         stamp = self.now.strftime("%Y-%m-%d %H:%M")
-        if verdict.action == "delete":
-            return ""
-        if verdict.ok:
-            head = f"### {stamp} · 校验通过，已提交\n"
+        if v.ok:
+            head = f"### {stamp} · 校验通过，已提交"
             lines = [
                 "- 结论：**通过**",
-                f"- 活动日期：{verdict.fields.get('活动日期', '')}",
-                f"- 使用节次：{verdict.fields.get('使用节次', '')}",
-                f"- 预计人数：{verdict.fields.get('预计人数', '')}",
-                f"- 处理：已提交教室申请，当前状态：{STATUS_SUBMITTED}",
+                f"- 活动：{v.fields.get('活动名称', '')} / {v.derived.get('日期', '')} "
+                f"{v.derived.get('开始', '')}-{v.derived.get('结束', '')}",
+                f"- 借用节次：**{v.derived.get('借用节次', '')}**（由活动时间推算）",
+                f"- 校区：{v.derived.get('校区', '')}（{v.derived.get('XXXQDM', '')}）"
+                f"　教学楼：{v.derived.get('教学楼', '')}　教室：{v.derived.get('教室', '')}",
+                f"- 人数：{v.derived.get('人数', '')}（默认）　联系电话：{v.derived.get('联系电话', '')}",
+                f"- 处理：已提交教室申请，当前状态 {STATUS_SUBMITTED}",
             ]
+        elif v.tier == "skip":
+            return
         else:
-            head = f"### {stamp} · 退回修改\n"
+            head = f"### {stamp} · 退回修改"
             lines = (
                 ["- 结论：**退回修改**", "- 原因："]
-                + [f"  {i}. {p}" for i, p in enumerate(verdict.problems, 1)]
-                + ["- 处理：请修改后把「状态」保持不变（待提交），agent 会在下一轮重新校验"]
+                + [f"  {i}. {p}" for i, p in enumerate(v.problems, 1)]
+                + ["- 处理：请修改后把「状态」改为 `待提交`，agent 会重新校验"]
             )
+        if v.fixes:
+            lines += ["- agent 自动规范化："] + [f"  - {f}" for f in v.fixes]
 
-        section = head + "\n".join(lines) + "\n"
-        if log_doc is None:
-            body = (
-                f"> ⚙️ 本文件由系统自动维护，请勿手动编辑。\n\n"
-                f"# 审批日志 · {app_doc.title}\n\n{section}"
+        section = head + "\n" + "\n".join(lines) + "\n"
+        log = self.find_log(app_node_uuid)
+        if log is None:
+            created = self.api.create_doc(
+                self.repo,
+                title=LOG_TITLE,
+                body=(
+                    "> ⚙️ 本文件由系统自动维护，请勿手动编辑。\n\n"
+                    f"# 审批日志 · {app.title}\n\n{section}"
+                ),
             )
-            created = self.api.create_doc(self.repo, title=LOG_TITLE, body=body)
-            self.mount(created.id, parent_node_uuid)
-            return section
-        body = self.read(log_doc.id) + "\n" + section
-        self.api.update_doc(self.repo, log_doc.id, body=body)
-        return section
+            self.mount(created.id, app_node_uuid)
+        else:
+            self.api.update_doc(
+                self.repo, log.id, body=(self.read(log.id).body or "") + "\n" + section
+            )
 
 
 # ---------------------------------------------------------------- 主流程
 def _week_dir_for(week_dirs: list, date: datetime | None, now: datetime):
-    """日期落在哪个周目录里。"""
     if date is None:
         return None
     for wd in week_dirs:
@@ -315,12 +473,12 @@ def _week_dir_for(week_dirs: list, date: datetime | None, now: datetime):
     return None
 
 
-def plan(kb: Kb) -> list[tuple]:
+def plan(kb: Kb) -> list[tuple[Doc, object, Verdict]]:
     items = kb.toc()
-    path = kb.node_path(items)
+    path = Kb.node_path(items)
     doc_node = {i.doc_id: i for i in items if i.doc_id}
     week_dirs = [i for i in items if i.type == "TITLE" and WEEK_TITLE_RE.match(i.title)]
-    structural = {GUIDE_TITLE, TEMPLATE_TITLE, ARCHIVE_TITLE, LOG_TITLE}
+    structural = {GUIDE_TITLE, ARCHIVE_TITLE, LOG_TITLE}
 
     out = []
     for doc in kb.docs():
@@ -328,33 +486,41 @@ def plan(kb: Kb) -> list[tuple]:
         in_archive = bool(node) and ARCHIVE_TITLE in path.get(node.uuid, [])
 
         if doc.title in structural:
-            out.append((doc, node, Verdict("skip", note="结构性文档")))
+            out.append((doc, node, Verdict("skip", tier="skip", note="结构性文档")))
             continue
 
-        fields = parse_fields(kb.read(doc.id))
-        if not looks_like_template(fields):
-            out.append(
-                (
-                    doc,
-                    node,
-                    Verdict(
-                        "delete", note=f"未使用模板（仅识别到 {len(fields)} 个字段），无法判断归属"
-                    ),
-                )
+        detail = kb.read(doc.id)
+        body = detail.body or ""
+        author = str((detail.creator or {}).get("name") or "")
+        fields = parse_fields(body)
+
+        if len(fields) >= 3:  # 用了模板
+            v = evaluate(fields, title=doc.title, author=author, now=kb.now)
+        else:
+            v = salvage(body, title=doc.title, author=author, now=kb.now) or Verdict(
+                "delete",
+                tier="orphan",
+                note=f"没用模板，也提取不到日期/时间/校区（识别到 {len(fields)} 个字段）",
             )
-            continue
 
-        v = evaluate(fields, kb.now)
-        if v.fields.get("状态") != "待提交":
+        if v.tier == "skip":
             out.append((doc, node, v))
             continue
 
-        v.new_status = STATUS_SUBMITTED if v.ok else STATUS_REJECTED
+        if v.action == "delete":
+            out.append((doc, node, v))
+            continue
 
-        date = parse_date(v.fields.get("活动日期", ""), kb.now)
+        # 归属周目录
+        date = None
+        if v.derived.get("日期"):
+            date = datetime.strptime(str(v.derived["日期"]), "%Y-%m-%d").replace(tzinfo=CN)
         target = _week_dir_for(week_dirs, date, kb.now)
         if target is None:
-            v.note = "找不到对应的周目录（日期超出当前窗口），保持原位并记录"
+            v.problems.append("活动日期不在当前可申请的周目录范围内（只接受当前周与下一周）")
+            v.ok = False
+            v.tier = "rejected"
+            v.new_status = STATUS_REJECTED
         elif in_archive or node is None or node.parent_uuid != target.uuid:
             v.action = "move"
             v.target_title = target.title
@@ -363,16 +529,16 @@ def plan(kb: Kb) -> list[tuple]:
 
 
 def approve_doc(kb: Kb, key: str) -> None:
-    """把一份申请推进到「已通过」（学校审核通过后由 agent 调用）。"""
+    """把一份申请推进到「已通过」（学校审核通过后调用）。"""
     doc = next((d for d in kb.docs() if d.slug == key or d.title == key), None)
     if doc is None:
         print(f"  ! 找不到文档：{key}")
         return
-    kb.api.update_doc(kb.repo, doc.id, body=set_status(kb.read(doc.id), STATUS_APPROVED))
+    kb.set_status(doc, STATUS_APPROVED)
 
     node = next((i for i in kb.toc() if i.doc_id == doc.id), None)
     if node is None:
-        print(f"  ✓ {doc.title} → {STATUS_APPROVED}（但不在目录中，未写日志）")
+        print(f"  ✓ {doc.title} → {STATUS_APPROVED}（不在目录中，未写日志）")
         return
     stamp = kb.now.strftime("%Y-%m-%d %H:%M")
     section = (
@@ -380,28 +546,26 @@ def approve_doc(kb: Kb, key: str) -> None:
         "- 结论：**已通过**\n"
         "- 处理：申请已通过，本文档归档，请勿再修改\n"
     )
-    items = kb.toc()
-    log_doc = next(
-        (
-            d
-            for d in kb.docs()
-            if d.title == LOG_TITLE
-            and any(i.doc_id == d.id and i.parent_uuid == node.uuid for i in items)
-        ),
-        None,
-    )
-    if log_doc:
-        kb.api.update_doc(kb.repo, log_doc.id, body=kb.read(log_doc.id) + "\n" + section)
+    log = kb.find_log(node.uuid)
+    if log:
+        kb.api.update_doc(kb.repo, log.id, body=(kb.read(log.id).body or "") + "\n" + section)
     else:
         created = kb.api.create_doc(
             kb.repo,
             title=LOG_TITLE,
-            body=(
-                f"> ⚙️ 本文件由系统自动维护，请勿手动编辑。\n\n# 审批日志 · {doc.title}\n\n{section}"
-            ),
+            body=f"> ⚙️ 本文件由系统自动维护，请勿手动编辑。\n\n# 审批日志 · {doc.title}\n\n{section}",
         )
         kb.mount(created.id, node.uuid)
     print(f"  ✓ {doc.title} → {STATUS_APPROVED}")
+
+
+TIER_LABEL = {
+    "ok": "合规",
+    "normalized": "可处理为合规（已自动规范化）",
+    "rejected": "绝对不合规（退回）",
+    "orphan": "不像申请（删除）",
+    "skip": "跳过",
+}
 
 
 def main() -> None:
@@ -426,7 +590,7 @@ def main() -> None:
             return
 
         items = kb.toc()
-        path = kb.node_path(items)
+        path = Kb.node_path(items)
         archive = next((i for i in items if i.type == "TITLE" and i.title == ARCHIVE_TITLE), None)
 
         print(f"# KB={args.repo}  现在={kb.now:%Y-%m-%d %H:%M} (UTC+8)  dry_run={not args.apply}\n")
@@ -434,16 +598,21 @@ def main() -> None:
         for doc, node, v in reports:
             loc = " / ".join(path.get(node.uuid, [])) if node else "(不在目录)"
             print(f"## {doc.title}  (#{doc.id})")
-            print(f"   位置: {loc or '(根)'}   节点: {node.uuid if node else '无'}")
-            print(f"   判定: {v.action} {('→ ' + v.target_title) if v.target_title else ''}")
-            if v.new_status:
-                print(f"   状态: 待提交 → {v.new_status}")
+            print(f"   位置: {loc or '(根)'}")
+            print(
+                f"   判定: 「{TIER_LABEL.get(v.tier, v.tier)}」 动作={v.action}"
+                f"{(' → ' + v.target_title) if v.target_title else ''}"
+            )
             if v.note:
                 print(f"   说明: {v.note}")
+            for f in v.fixes:
+                print(f"   ↻ {f}")
             for p in v.problems:
                 print(f"   ✗ {p}")
-            if v.fields:
-                print(f"   字段: { {k: val for k, val in v.fields.items() if val} }")
+            if v.derived:
+                print(f"   提交参数: {v.derived}")
+            if v.new_status:
+                print(f"   状态: {STATUS_PENDING} → {v.new_status}")
             print()
 
         if not args.apply:
@@ -452,58 +621,41 @@ def main() -> None:
 
         print("=" * 60, "\n开始执行")
         for doc, node, v in reports:
-            try:
-                if v.action == "delete":
-                    kb.delete(doc.id)
-                    print(f"  ✗ 已删除：{doc.title}（{v.note}）")
-                elif v.action == "move":
-                    target = next(i for i in items if i.title == v.target_title)
-                    if node is None:
-                        kb.mount(doc.id, target.uuid)
-                    else:
-                        kb.move(node.uuid, target.uuid)
-                    print(f"  → 已移动：{doc.title} → {v.target_title}")
-            except YuqueError as exc:
-                print(f"  ! {doc.title} 操作失败：{exc}")
+            if v.action == "delete":
+                kb.delete(doc.id)
+                print(f"  ✗ 已删除：{doc.title}（{v.note}）")
+            elif v.action == "move":
+                target = next(i for i in items if i.title == v.target_title)
+                if node is None:
+                    kb.mount(doc.id, target.uuid)
+                else:
+                    kb.move(node.uuid, target.uuid)
+                print(f"  → 已移动：{doc.title} → {v.target_title}")
 
-        # 写回状态（移动之后再写，避免中途失败导致状态已改但位置没动）
         for doc, _node, v in reports:
             if not v.new_status:
                 continue
             try:
-                kb.api.update_doc(kb.repo, doc.id, body=set_status(kb.read(doc.id), v.new_status))
-                print(f"  ⇄ 状态已改为：{doc.title} → {v.new_status}")
+                kb.set_status(doc, v.new_status)
+                print(f"  ⇄ 状态：{doc.title} → {v.new_status}")
             except YuqueError as exc:
                 print(f"  ! {doc.title} 改状态失败：{exc}")
 
-        # 审批日志（移动后再写，确保拿得到父节点）
-        for doc, _node, v in reports:
+        for doc, node, v in reports:
             if v.action == "delete" or not v.new_status:
                 continue
+            dag = {i.doc_id: i for i in kb.toc() if i.doc_id}
+            node = dag.get(doc.id)
+            if node is None:
+                print(f"  ! {doc.title} 找不到目录节点，跳过日志")
+                continue
             try:
-                fresh = {i.doc_id: i for i in kb.toc() if i.doc_id}
-                parent_node = fresh.get(doc.id)
-                if parent_node is None:
-                    print(f"  ! {doc.title} 找不到目录节点，跳过日志")
-                    continue
-                log_doc = next(
-                    (
-                        d
-                        for d in kb.docs()
-                        if d.title == LOG_TITLE
-                        and any(
-                            i.doc_id == d.id and i.parent_uuid == parent_node.uuid for i in kb.toc()
-                        )
-                    ),
-                    None,
-                )
-                kb.append_log(doc, log_doc, parent_node.uuid, v)
-                print(f"  ✎ 已写审批日志：{doc.title} → {'通过' if v.ok else '退回修改'}")
+                kb.write_log(doc, node.uuid, v)
+                print(f"  ✎ 审批日志：{doc.title} → {TIER_LABEL.get(v.tier, v.tier)}")
             except YuqueError as exc:
                 print(f"  ! {doc.title} 写日志失败：{exc}")
 
-        # 归档：过期的周目录
-        if archive:
+        if archive:  # 过期周目录归档
             for wd in [i for i in items if i.type == "TITLE" and WEEK_TITLE_RE.match(i.title)]:
                 m = WEEK_TITLE_RE.match(wd.title)
                 end = datetime.strptime(
