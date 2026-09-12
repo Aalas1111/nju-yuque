@@ -47,8 +47,23 @@
 
 - 路径参数同时接受**数字 id** 和 **slug**。
 - 返回字段：`format`、`body`（**正文 Markdown**）、`body_draft`、`body_html`、`body_lake`、
-  `tags`、`creator`、`book`、`comments_count`、`word_count`。
+  `body_sheet`、`body_table`、`tags`、`creator`、`book`、`comments_count`、`word_count`。
+- **文档类型 `type`**：`Doc` 普通文档 / `Sheet` 表格 / `Table` **数据表** / `Thread` 话题 /
+  `Board` 图集 / `HtmlDoc`。
 - `format` 取值：`lake`（普通文档，但 `body` 仍是 Markdown）、`markdown`、`lakesheet`（表格）。
+- 数据表用 `page` + `page_size`（≤200）分页读取，正文在 **`body_table`**
+  （`{totalCount, records:[{values:[...]}], meta:{columns}}`，只读字段）。
+
+### 2.2.1 能创建什么、不能创建什么（实测）
+
+```
+POST /repos/{id}/docs  format=lake   → 200 type=Doc
+POST ...               format=html   → 200 type=Doc format=lake（被服务端转换）
+POST ...               format=lark / table / datatable / sheet / lakesheet → 422
+```
+
+→ **API 只能创建普通文档**；表格与数据表必须在网页上手工建一次。
+表格/数据表的**行内容也无法通过 API 写入**（`body_sheet`/`body_table` 不在请求体 schema 里）。
 
 ### 2.3 搜索
 
@@ -66,7 +81,6 @@
 ---
 
 ## 3. 表格（Sheet / lakesheet）
-
 表格文档 `body` 形如：
 
 ```json
@@ -120,6 +134,18 @@ sheets = json.loads(zlib.decompress(body_json["sheet"].encode("latin-1")).decode
 3. `removeNode` 只移除目录节点，**不删除关联文档**；`action_mode=child` 连子节点一起移除。
 4. 新建文档**不会自动进目录**，需要额外调一次 TOC 接口。
 
+### 4.2.1 移动节点（归档的关键）
+
+`editNode` + `node_uuid` + `target_uuid` = **把节点移动到另一个父节点下**（实测可用）：
+
+```json
+{"action": "editNode", "action_mode": "child",
+ "node_uuid": "<被移动的节点>", "target_uuid": "<新的父节点>"}
+```
+
+归档 = 把过期的周目录节点移到 `99-归档` 分组下；搭配 `visible` 字段还能隐藏节点
+（**但 `visible=0` 只是隐藏，不是只读**）。
+
 ### 4.3 知识库
 
 | 操作 | 请求 |
@@ -131,7 +157,41 @@ sheets = json.loads(zlib.decompress(body_json["sheet"].encode("latin-1")).decode
 
 ---
 
-## 5. 网页内部接口（Cookie 模式）
+## 5. 权限模型（agent 只能管到知识库/团队粒度）
+
+简要结论，详见 [`permission-feasibility.md`](./permission-feasibility.md)：
+
+- 官方 API 与权限有关的操作**只有 4 个**：团队成员角色（`PUT /groups/{login}/users/{id}`，
+  `0` 管理员 / `1` 成员 / `2` 只读成员）、知识库 `public`（0/1/2）、
+  建库时的 `enhancedPrivacy`、目录节点 `visible`（0/1）。
+- **没有**知识库协作者、知识库成员默认权限、文档级编辑权限、目录只读、模板/表单校验。
+- 「社员不能改指导文档」「归档只读」必须在**知识库粒度**上做（两库分离：投稿库可编辑 /
+  正式库对社员仅查看），或靠 agent 巡检 + 用历史版本回滚。
+- **语雀没有内容锁定/限制编辑**（网上搜到的「内容锁定」是 Umo Editor）。
+
+## 6. 文档历史版本（修改时间线）
+
+```
+GET /api/v2/doc_versions?doc_id=<id>      → [{id, title, user:{name}, created_at, updated_at}, ...]
+GET /api/v2/doc_versions/{version_id}     → {body, body_md, body_html, body_asl, format, user, ...}
+```
+
+- 可用于「自上次审批后文档是否被改过」的判定，以及**回滚**（取旧正文再 `PUT` 回去）。
+- 粒度是「一次保存/发布」，不是每次按键；返回可能分页，别假设一次拿全。
+
+## 7. 写权限实测（官方 API）
+
+| 操作 | 结果 |
+|---|---|
+| 建/改/删文档 | ✅ |
+| 挂目录 / 移动节点 / 移除节点 / 建分组 | ✅ |
+| 建知识库 / 删知识库 / 改公开性 | ✅ |
+| 建表格（Sheet）/ 建数据表（Table） | ❌ 422 |
+| 写表格 / 数据表的单元格 | ❌ 无接口 |
+| 发评论 / @人 | ❌ 官方无评论接口（仅 Cookie 模式） |
+| 改知识库成员权限 / 协作者 | ❌ 无接口（仅网页 UI） |
+
+## 8. 网页内部接口（Cookie 模式）
 
 社区验证（`yuque-cli`、`yuque-mcp` 等）与本项目实现：
 
@@ -156,7 +216,7 @@ sheets = json.loads(zlib.decompress(body_json["sheet"].encode("latin-1")).decode
 
 ---
 
-## 6. 事件订阅（Webhook）
+## 9. 事件订阅（Webhook）
 
 `知识库 → 设置 → 开发者 / 消息推送` 可订阅：发布/更新/删除文档、评论增删改、回复增删改。
 
@@ -167,16 +227,17 @@ sheets = json.loads(zlib.decompress(body_json["sheet"].encode("latin-1")).decode
 
 ---
 
-## 7. 语雀没有的能力（能力边界）
+## 10. 语雀没有的能力（能力边界）
 
 - **官方 OpenAPI 没有评论接口**，也没有站内私信/群通知 → 「通知某人」只能
-  ①Cookie 模式评论 + @ ②写一份退还意见文档 + 人工转达 ③接入外部 IM。
-- 没有「表单」能力；填表载体只能是文档或表格（Sheet）。
-- 「数据表 / 多维表格」尚未验证（团队里没有样本，官方也没有专门端点）。
+  ①Cookie 模式评论 + @ ②写一份审批日志文档 + 人工转达 ③接入外部 IM。
+- 没有「表单」能力，也**没有「内容锁定 / 限制编辑」**；填表载体只能是文档或表格/数据表。
+- **没有文档级 / 目录级权限接口**，权限只能到知识库或团队粒度，且要靠网页 UI 配置。
+- **不能写表格 / 数据表的行**，也不能创建表格 / 数据表。
 
 ---
 
-## 8. 限流与错误
+## 11. 限流与错误
 
 - 观测到响应头 `x-ratelimit-limit: 0`，连续 30 次请求无 429；批量拉取建议仍自行限速。
 - 错误体形如 `{"status": 4xx, "message": "..."}`；客户端按状态码映射异常：
