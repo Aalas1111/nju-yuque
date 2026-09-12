@@ -583,6 +583,11 @@ def plan(kb: Kb, guide_id: int | None = None) -> list[tuple[Doc, object, Verdict
             out.append((doc, node, Verdict("skip", tier="skip", note="审批日志（结构性）")))
             continue
 
+        # 归档区是终点站：里面的东西一律不碰（不改状态、不移动、更不删除）
+        if in_archive:
+            out.append((doc, node, Verdict("skip", tier="skip", note="已归档，不再处理")))
+            continue
+
         detail = kb.read(doc.id)
         body = detail.body or ""
         author = str((detail.creator or {}).get("name") or "")

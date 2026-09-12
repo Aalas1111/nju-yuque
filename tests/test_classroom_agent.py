@@ -10,6 +10,8 @@ import pathlib
 import sys
 from datetime import datetime
 
+from nju_yuque.models import Doc, TocItem
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location(
     "classroom_agent", ROOT / "examples" / "classroom_application_agent.py"
@@ -268,3 +270,53 @@ def test_blank_title_is_rejected() -> None:
     assert not v.ok and any("标题" in p for p in v.problems)
     v2 = agent.evaluate(make(), title="指导文档（必读）", author="张三", now=NOW)
     assert not v2.ok and any("重名" in p for p in v2.problems)
+
+
+# ---------------------------------------------------------------- 归档区是终点站
+class _FakeKb:
+    """只实现 plan() 用到的那几个方法。"""
+
+    def __init__(self, items, docs, now) -> None:
+        self._items, self._docs, self.now = items, docs, now
+
+    def toc(self):
+        return self._items
+
+    def docs(self):
+        return self._docs
+
+    def read(self, doc_id):
+        return next(d for d in self._docs if d.id == doc_id)
+
+
+def _toc(uuid, type_, title, parent="", doc_id=None, slug=""):
+    return TocItem(
+        uuid=uuid,
+        type=type_,
+        title=title,
+        url="",
+        slug=slug,
+        doc_id=doc_id,
+        level=None,
+        parent_uuid=parent,
+        child_uuid="",
+    )
+
+
+def test_archived_docs_are_never_touched_not_even_deleted() -> None:
+    """归档区里的东西一律跳过——尤其是「不像申请」的文档不能被删掉。"""
+    items = [
+        _toc("arch", "TITLE", "归档区"),
+        _toc("week", "TITLE", "0907-0913", parent="arch"),
+        _toc("n1", "DOC", "上周例会", parent="week", doc_id=1, slug="s1"),
+        _toc("n2", "DOC", "随便写写", parent="week", doc_id=2, slug="s2"),
+    ]
+    docs = [
+        Doc(id=1, slug="s1", title="上周例会", body="状态：待提交\n\n申请人：小A"),
+        Doc(id=2, slug="s2", title="随便写写", body="今天天气不错"),
+    ]
+    reports = agent.plan(_FakeKb(items, docs, NOW), guide_id=None)
+    assert len(reports) == 2
+    for _doc, _node, v in reports:
+        assert v.action == "skip", v
+        assert "已归档" in v.note
