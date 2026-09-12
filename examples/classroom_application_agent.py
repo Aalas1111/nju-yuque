@@ -54,7 +54,9 @@ ADVANCE_HOURS = 48  # 提前量
 DAY_START, DAY_END = 8 * 60, 22 * 60 + 20  # 可申请时段 08:00 - 22:20
 LUNCH_START, LUNCH_END = 12 * 60, 14 * 60  # 吃饭时间，不可重叠
 
-# 节次：(第几节, 开始分钟, 结束分钟)
+# 节次：(第几节, 实际上课开始, 实际上课结束分钟)
+# 匹配时按「一小时一档」处理（档位结束 = 开始 + 60 分），课间那 10 分钟不纠结：
+# 第 1 节 ≈ 08:00-09:00，第 7 节 ≈ 16:10-17:10。
 PERIODS: list[tuple[int, int, int]] = [
     (1, 480, 530),
     (2, 540, 590),
@@ -69,6 +71,8 @@ PERIODS: list[tuple[int, int, int]] = [
     (11, 1230, 1280),
     (12, 1290, 1340),
 ]
+
+SLOT_MINUTES = 60  # 一节课按「一小时一档」匹配
 
 CAMPUSES: dict[str, tuple[str, str]] = {  # 别名 -> (规范名, 学校代码)
     "鼓楼": ("鼓楼", "1"),
@@ -214,8 +218,12 @@ def normalize_campus(raw: str) -> tuple[str, str, str]:
 
 
 def derive_periods(start: int, end: int) -> tuple[int, int] | None:
-    """活动时间覆盖了哪些节次；返回 (起始节, 结束节)。"""
-    used = [p for p, ps, pe in PERIODS if min(end, pe) > max(start, ps)]
+    """活动时间覆盖了哪些节次；返回 (起始节, 结束节)。
+
+    按「一小时一档」匹配：第 1 节 = 08:00-09:00、第 7 节 = 16:10-17:10，
+    课间那 10 分钟不算单独的档；比如 09:50-10:10 落在第 2 节。
+    """
+    used = [p for p, ps, _pe in PERIODS if min(end, ps + SLOT_MINUTES) > max(start, ps)]
     if not used:
         return None
     return min(used), max(used)
@@ -282,11 +290,11 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
 
     # --- 节次推算 ---
     if start is not None and end is not None and not v.problems:
-        # 不做「对齐到整点/半点」—— 节次本来就是 08:00 / 10:10 / 16:10 / 18:30 这种不规则起点
+        # 匹配用的是「一小时一档」，所以不用把用户写的时间对齐到整点/半点
         periods = derive_periods(start, end)
         if periods is None:
             v.problems.append(
-                f"活动时间 {_hm(start)}-{_hm(end)} 对不上任何节次（它是两节课之间的空档）"
+                f"活动时间 {_hm(start)}-{_hm(end)} 对不上任何节次（整段都落在课间空档里）"
             )
         else:
             ksjc, jsjc = periods

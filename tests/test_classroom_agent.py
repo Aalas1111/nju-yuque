@@ -49,8 +49,11 @@ def test_derive_periods_more() -> None:
     assert agent.derive_periods(8 * 60, 8 * 60 + 50) == (1, 1)
     assert agent.derive_periods(8 * 60, 12 * 60) == (1, 4)
     assert agent.derive_periods(14 * 60, 21 * 60 + 20) == (5, 11)
-    # 两节课之间的空档 → 对不上任何节次
-    assert agent.derive_periods(9 * 60 + 50, 10 * 60 + 10) is None
+    # 「一小时一档」：课间 10 分钟忽略
+    assert agent.derive_periods(16 * 60, 17 * 60) == (7, 7)
+    assert agent.derive_periods(9 * 60 + 50, 10 * 60 + 10) == (2, 2)
+    # 整段都在课间空档里 → 对不上任何节次
+    assert agent.derive_periods(10 * 60, 10 * 60 + 10) is None
     assert agent.derive_periods(12 * 60 + 30, 13 * 60 + 30) is None
 
 
@@ -154,9 +157,11 @@ def test_rejected_out_of_window() -> None:
 
 
 def test_rejected_gap_between_classes() -> None:
-    v = agent.evaluate(make(活动时间="09:50-10:10"), title="t", author="a", now=NOW)
+    v = agent.evaluate(make(活动时间="10:00-10:10"), title="t", author="a", now=NOW)
     assert not v.ok
     assert any("对不上任何节次" in p for p in v.problems)
+    # 而 09:50-10:10 因为「一小时一档」算第 2 节，应当通过
+    assert agent.evaluate(make(活动时间="09:50-10:10"), title="t", author="a", now=NOW).ok
 
 
 def test_rejected_missing_and_bad_campus() -> None:
