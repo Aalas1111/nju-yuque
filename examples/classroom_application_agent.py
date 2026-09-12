@@ -27,6 +27,7 @@ import argparse
 import os
 import re
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -110,6 +111,7 @@ class Verdict:
     derived: dict[str, object] = field(default_factory=dict)
     note: str = ""
     new_status: str = ""
+    lunch_skipped: bool = False  # 活动跨了午饭时段，节次需按可用区间取并集
 
 
 # ---------------------------------------------------------------- 规范化
@@ -209,12 +211,12 @@ def normalize_campus(raw: str) -> tuple[str, str, str]:
 
 
 def subtract_lunch(start: int, end: int) -> list[tuple[int, int]]:
-    """从 [start, end) 里剔除 12:00-14:00 吃饭时间，返回剩下的区间。
+    """从 [start, end) 里剔除 12:00-14:00 吃饭时间，返回剩下的可用区间。
 
-    午饭时段不是「违规」，而是「不需要借教室」：
+    午饭时段不是「违规」，而是「这段不需要借教室」：
     - 完全落在午饭内 → 返回空 → 不需要借教室，退回
-    - 只跨到一边（13:00-15:00）→ 取 14:00-15:00
-    - 两边都跨（11:00-15:00）→ 返回两段 → 请申请人拆成上下午两场
+    - 只跨一边（13:00-15:00）→ 返回 [(14:00, 15:00)]
+    - 两边都跨（11:00-15:00）→ 返回两段，节次取并集（第 4-5 节）
     """
     out: list[tuple[int, int]] = []
     if start < LUNCH_START:
@@ -224,16 +226,24 @@ def subtract_lunch(start: int, end: int) -> list[tuple[int, int]]:
     return [(s, e) for s, e in out if e > s]
 
 
-def derive_periods(start: int, end: int) -> tuple[int, int] | None:
-    """活动时间覆盖了哪些节次；返回 (起始节, 结束节)。
+def derive_periods_multi(segments: Sequence[tuple[int, int]]) -> tuple[int, int] | None:
+    """多个可用区间覆盖了哪些节次；返回 (起始节, 结束节)。
 
     按「一小时一档」匹配：第 1 节 = 08:00-09:00、第 7 节 = 16:00-17:00，
-    课间那 10 分钟不计；比如 16:10-18:00 → 第 7-8 节。
+    课间那 10 分钟不计。跨午饭时取各区间节次的并集：
+    11:00-12:00 + 14:00-15:00 → 第 4-5 节（学校表单本来就是「起节-止节」一个区间）。
     """
-    used = [p for p, ps, pe in PERIODS if min(end, pe) > max(start, ps)]
+    used: set[int] = set()
+    for start, end in segments:
+        used.update(p for p, ps, pe in PERIODS if min(end, pe) > max(start, ps))
     if not used:
         return None
     return min(used), max(used)
+
+
+def derive_periods(start: int, end: int) -> tuple[int, int] | None:
+    """单个时间区间覆盖了哪些节次。"""
+    return derive_periods_multi([(start, end)])
 
 
 # ---------------------------------------------------------------- 判定
@@ -283,23 +293,13 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
                 f"活动时间 {_hm(start)}-{_hm(end)} 超出可申请时段 {_hm(DAY_START)}-{_hm(DAY_END)}"
             )
         # 剔除吃饭时间：不是「违规」，而是这段时间不需要借教室
-        bookable = subtract_lunch(start, end)
-        if not bookable:
+        if not subtract_lunch(start, end):
             v.problems.append(
                 f"活动时间 {_hm(start)}-{_hm(end)} 完全落在 {_hm(LUNCH_START)}-{_hm(LUNCH_END)} "
                 "吃饭时间内，不需要借教室"
             )
-        elif len(bookable) > 1:
-            v.problems.append(
-                f"活动横跨 {_hm(LUNCH_START)}-{_hm(LUNCH_END)} 吃饭时间（{_hm(start)}-{_hm(end)}），"
-                "请拆成上下午两场分别申请"
-            )
-        elif bookable[0] != (start, end):
-            bs, be = bookable[0]
-            v.fixes.append(
-                f"吃饭时间不需要借教室，活动时间 {_hm(start)}-{_hm(end)} → 只借 {_hm(bs)}-{_hm(be)}"
-            )
-            start, end = bs, be
+        elif subtract_lunch(start, end) != [(start, end)]:
+            v.lunch_skipped = True
 
     # --- 校区 ---
     campus, campus_code, campus_fix = normalize_campus(v.fields.get("校区", ""))
@@ -313,16 +313,22 @@ def evaluate(fields: dict[str, str], *, title: str, author: str, now: datetime) 
     # --- 节次推算 ---
     if start is not None and end is not None and not v.problems:
         # 匹配用的是「一小时一档」，档位起点已经把课间 10 分钟舍掉了
-        periods = derive_periods(start, end)
+        periods = derive_periods_multi(subtract_lunch(start, end))
         if periods is None:
             v.problems.append(f"活动时间 {_hm(start)}-{_hm(end)} 对不上任何节次")
         else:
             ksjc, jsjc = periods
+            span = f"{ksjc}-{jsjc}" if ksjc != jsjc else str(ksjc)
+            if v.lunch_skipped:
+                v.fixes.append(
+                    f"{_hm(LUNCH_START)}-{_hm(LUNCH_END)} 吃饭时间不需要借教室，"
+                    f"按可用时段推得第 {span} 节"
+                )
             v.derived = {
                 "日期": f"{date:%Y-%m-%d}" if date else "",
                 "开始": _hm(start),
                 "结束": _hm(end),
-                "借用节次": f"{ksjc}-{jsjc}" if ksjc != jsjc else str(ksjc),
+                "借用节次": span,
                 "KSJC": ksjc,
                 "JSJC": jsjc,
                 "校区": campus,
