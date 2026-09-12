@@ -37,9 +37,10 @@ ARCHIVE_TITLE = "归档区"
 WEEK_TITLE_RE = re.compile(r"^(\d{2})(\d{2})\s*[-~～]\s*(\d{2})(\d{2})")
 
 # 状态机（agent 会改写文档首行的「状态」）
-STATUS_PENDING = "待提交"  # 待处理
-STATUS_REGISTERED = "已登记（等待提交教室申请）"  # 校验通过
-STATUS_REJECTED = "已退回（修改后请把状态改为待提交）"  # 校验不通过
+STATUS_PENDING = "待提交"  # 社员写，等 agent 校验
+STATUS_SUBMITTED = "已提交（待审核通过）"  # agent 写，已提交学校系统
+STATUS_APPROVED = "已通过（本文档已归档，禁止再次修改）"  # agent 写，终态
+STATUS_REJECTED = "已退回（修改后请把状态改为待提交）"  # agent 写，等社员改回待提交
 STATUS_RE = re.compile(r"^([ 	>*\-•]*\**\s*状态\s*\**\s*[:：][ 	]*)(.*)$", re.MULTILINE)
 
 ADVANCE_HOURS = 48  # 必须提前 48 小时
@@ -261,13 +262,13 @@ class Kb:
         if verdict.action == "delete":
             return ""
         if verdict.ok:
-            head = f"### {stamp} · 校验通过\n"
+            head = f"### {stamp} · 校验通过，已提交\n"
             lines = [
                 "- 结论：**通过**",
                 f"- 活动日期：{verdict.fields.get('活动日期', '')}",
                 f"- 使用节次：{verdict.fields.get('使用节次', '')}",
                 f"- 预计人数：{verdict.fields.get('预计人数', '')}",
-                "- 处理：已登记，等待批量提交",
+                f"- 处理：已提交教室申请，当前状态：{STATUS_SUBMITTED}",
             ]
         else:
             head = f"### {stamp} · 退回修改\n"
@@ -348,7 +349,7 @@ def plan(kb: Kb) -> list[tuple]:
             out.append((doc, node, v))
             continue
 
-        v.new_status = STATUS_REGISTERED if v.ok else STATUS_REJECTED
+        v.new_status = STATUS_SUBMITTED if v.ok else STATUS_REJECTED
 
         date = parse_date(v.fields.get("活动日期", ""), kb.now)
         target = _week_dir_for(week_dirs, date, kb.now)
@@ -361,14 +362,69 @@ def plan(kb: Kb) -> list[tuple]:
     return out
 
 
+def approve_doc(kb: Kb, key: str) -> None:
+    """把一份申请推进到「已通过」（学校审核通过后由 agent 调用）。"""
+    doc = next((d for d in kb.docs() if d.slug == key or d.title == key), None)
+    if doc is None:
+        print(f"  ! 找不到文档：{key}")
+        return
+    kb.api.update_doc(kb.repo, doc.id, body=set_status(kb.read(doc.id), STATUS_APPROVED))
+
+    node = next((i for i in kb.toc() if i.doc_id == doc.id), None)
+    if node is None:
+        print(f"  ✓ {doc.title} → {STATUS_APPROVED}（但不在目录中，未写日志）")
+        return
+    stamp = kb.now.strftime("%Y-%m-%d %H:%M")
+    section = (
+        f"### {stamp} · 学校审核通过\n"
+        "- 结论：**已通过**\n"
+        "- 处理：申请已通过，本文档归档，请勿再修改\n"
+    )
+    items = kb.toc()
+    log_doc = next(
+        (
+            d
+            for d in kb.docs()
+            if d.title == LOG_TITLE
+            and any(i.doc_id == d.id and i.parent_uuid == node.uuid for i in items)
+        ),
+        None,
+    )
+    if log_doc:
+        kb.api.update_doc(kb.repo, log_doc.id, body=kb.read(log_doc.id) + "\n" + section)
+    else:
+        created = kb.api.create_doc(
+            kb.repo,
+            title=LOG_TITLE,
+            body=(
+                f"> ⚙️ 本文件由系统自动维护，请勿手动编辑。\n\n# 审批日志 · {doc.title}\n\n{section}"
+            ),
+        )
+        kb.mount(created.id, node.uuid)
+    print(f"  ✓ {doc.title} → {STATUS_APPROVED}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="教室申请知识库自动维护（默认 dry-run）")
     ap.add_argument("--repo", required=True, help="知识库 id 或 group/slug")
     ap.add_argument("--apply", action="store_true", help="真正执行（默认只打印计划）")
+    ap.add_argument(
+        "--approve",
+        action="append",
+        default=[],
+        metavar="标题或slug",
+        help="把指定申请推进到「已通过」（学校审核通过后调用；可重复）",
+    )
     args = ap.parse_args()
 
     kb = Kb(args.repo)
     try:
+        if args.approve:
+            print(f"# KB={args.repo}  现在={kb.now:%Y-%m-%d %H:%M}")
+            for key in args.approve:
+                approve_doc(kb, key)
+            return
+
         items = kb.toc()
         path = kb.node_path(items)
         archive = next((i for i in items if i.type == "TITLE" and i.title == ARCHIVE_TITLE), None)
