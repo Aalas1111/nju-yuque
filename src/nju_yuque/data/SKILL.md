@@ -1,6 +1,6 @@
 ---
 name: yuque
-description: 语雀（Yuque）自动化。当用户提到「语雀 / yuque / 知识库 / 语雀文档 / 语雀表格 / 教室申请文档 / 社团填表 / 在语雀里看 / 把结果发到语雀 / 退回申请并通知 / 建知识库」等，或需要读取语雀知识库里的文档与表格、写/改文档、挂目录、做增量检测、在文档下评论 @人时，使用本 skill。通过本地 `yuque` CLI 复用登录态；读操作随时可用，写操作与评论必须用户明确授权。
+description: 语雀（Yuque）自动化。当用户提到「语雀 / yuque / 知识库 / 语雀文档 / 语雀表格 / 教室申请文档 / 教室申请 agent / 社团填表 / 在语雀里看 / 把结果发到语雀 / 退回申请并通知 / 建知识库」等，或需要读取语雀知识库里的文档与表格、写/改文档、挂目录、做增量检测、在文档下评论 @人时，使用本 skill。通过本地 `yuque` CLI 复用登录态；读操作随时可用，写操作与评论必须用户明确授权。
 ---
 
 # 语雀（Yuque）自动化
@@ -126,6 +126,22 @@ yuque watch --repo ghxd00/<book> --json     # 首次记录水位线到 ~/.yuque/
 yuque watch --repo ghxd00/<book> --json     # 之后只返回新变动
 ```
 
+### 4.1) 教室申请 agent（`yuque classroom`，对语雀只读）
+
+社团填表 → agent 判定要素 → 出申请 JSON / 出通知事件，都交给本地 CLI 完成，
+**不需要 AI 手工读文档再拼 JSON**：
+
+```bash
+yuque classroom once  --repo <book> --dry-run        # 先看判定（不落盘、不通知）
+yuque classroom once  --repo <book>                  # 跑一轮
+yuque classroom serve --repo <book> --port 8765      # webhook + 轮询常驻
+yuque classroom status --repo <book>                 # 本地状态（哪些受理/退回）
+yuque classroom outbox list --repo <book>            # 还没投递的通知事件
+```
+
+识别规则只有一条：申请文档**开头带草稿标记就不处理**（社员删掉标记 agent 才接管）；
+agent **不改语雀文档**。规则与契约见仓库里的 `docs/classroom-agent.md`。
+
 ### 5) 退回并通知（Cookie 模式）
 
 ```bash
@@ -144,7 +160,9 @@ yuque comment add ghxd00/<book>/<slug> \
    不要据此判定失败并重试（会重复挂载）。
 5. 写操作报 `需要令牌模式` 时，提示用户用写权限令牌登录，不要尝试绕过。
 6. 报 `请给此 Token 添加 xxx 权限` 时，说明令牌 scope 不足。
-7. 只处理「状态：待提交」的申请；`状态：草稿` 一律忽略（避免把半成品误当申请）。
+7. 教室申请走 `yuque classroom`：识别信号是**文档开头有没有草稿标记**——
+   有草稿 → 一律不处理；没有草稿 → 当成申请处理。**不要**再往文档里写
+   `状态：xxx`（agent 不再改语雀文档，反馈走通知事件）。
 
 ## 限制
 
@@ -153,3 +171,4 @@ yuque comment add ghxd00/<book>/<slug> \
 - 语雀没有「表单」；填表载体只能是文档或表格（Sheet）。
 - 表格（Sheet）可解；「数据表 / 多维表格」尚未验证。
 - `repo delete` 会连同知识库内所有文档一起消失，务必二次确认。
+- `yuque classroom` 的通知只落到本地 outbox（`notify/pending/`），投递到 QQ 由 qqbot 负责。

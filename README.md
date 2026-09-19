@@ -124,6 +124,17 @@ yuque doc   https://nova.yuque.com/ghxd00/mrge27/bbf1n662v36gd85q --json
 | `yuque comment add <链接> -m "..." --mention <login>` | 发评论 / @人 |
 | `yuque skill path / show / install` | 内置 AI Skill |
 
+### 教室申请 agent（对语雀只读）
+
+| 命令 | 作用 |
+|---|---|
+| `yuque classroom once --repo <...>` | 跑一轮：读知识库 → 判定要素 → 出申请 JSON / 发通知 |
+| `yuque classroom run --repo <...> [--interval 60]` | 轮询常驻 |
+| `yuque classroom serve --repo <...> --port 8765` | webhook + 轮询兜底常驻（推荐） |
+| `yuque classroom status / outbox / parse / rules / schema` | 看本地状态 / 通知队列 / 解析 webhook 报文 / 打印规则 / 导出 JSON 契约 |
+
+> 详见 [**教室申请 agent 设计与交接文档**](docs/classroom-agent.md)。
+
 > 所有命令都支持 `--json`；不确定参数时加 `--help`。
 
 ### 链接写法
@@ -216,25 +227,41 @@ uv run python scripts/sync_skill.py     # 改完 SKILL.md 后同步仓库内副�
 
 ---
 
-## 示例：教室申请知识库自动维护 agent
+## 教室申请 agent（`yuque classroom`）
 
-`examples/classroom_application_agent.py` 是一个真实场景的参考实现：
+社员在语雀里按模板填申请 → agent 判定要素 → 要素齐备就打包成固定格式 JSON，
+要素不对/文档被改/文档被删就产出通知事件（交给 qqbot 发 QQ）。
 
-- 审核申请文档（状态 / 必填 / 提前 48 小时 / 节次 / 人数）；
-- 规范合规文档的**状态**（`待提交` → `已登记（等待提交教室申请）` / `已退回（修改后请把状态改为待提交）`）；
-- 在申请文档下维护子文档 **`审批日志`**（时间戳 + 结论 + 意见）；
-- 放错位置但能识别的文档 → 移动到对应的周目录（如 `0914-0920`）；
-- 无法识别的文档 → 删除；过期周目录 → 移到 `归档区`。
+**设计原则**：
+
+- **对语雀只读**——不改正文、不写状态、不建审批日志、不移动目录、不删文档；
+- **唯一的输入信号是草稿标签**——文档开头带「草稿」就不处理，社员删掉它 agent 就接管；
+- **状态只在本地** `state.json` 里，语雀文档完全属于社员自己；
+- 反馈走 QQ（本仓库只产出事件，**不负责投递**）。
 
 ```bash
-# 默认 dry-run，只打印计划
-uv run python examples/classroom_application_agent.py --repo <group/slug>
-# 确认无误后执行
-uv run python examples/classroom_application_agent.py --repo <group/slug> --apply
+uv run yuque login --token <只读令牌>
+uv run yuque classroom once   --repo lqogh0/jsjysq --dry-run   # 先看判定
+uv run yuque classroom serve  --repo lqogh0/jsjysq --port 8765 --secret <随机串>
 ```
 
-> 规则细节见 [`docs/permission-feasibility.md`](docs/permission-feasibility.md)；
-> 语雀接口的坑见 [`docs/yuque-api-notes.md`](docs/yuque-api-notes.md)。
+产出（默认 `<YUQUE_HOME>/classroom/<repo>/`）：
+
+```
+applications/<application_id>.json   要素齐备的申请（交给负责提交的同学）
+applications/index.json              申请索引
+notify/pending/*.json                待投递通知事件（交给 qqbot）
+state.json                           agent 自己的记忆（哪些文档处理过了）
+```
+
+- 规则与契约：[`docs/classroom-agent.md`](docs/classroom-agent.md)
+- 申请 JSON 的机器可读契约：[`docs/classroom-application.schema.json`](docs/classroom-application.schema.json)
+- 知识库里的指导文档 / 模板源文件：[`examples/classroom_kb/`](examples/classroom_kb/)
+
+```bash
+# 离线跑一遍规则层单测（不需要网络、不需要登录）
+uv run pytest tests/test_classroom_rules.py -v
+```
 
 ---
 
