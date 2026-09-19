@@ -213,13 +213,20 @@ def test_runner_without_port_has_no_server(tmp_path: Path) -> None:
 
 
 def _wait(pred: object, timeout: float = 10.0) -> bool:
-    """等某个条件成立（轮询式等待，避免测试变 flaky）。"""
+    """等某个条件成立（轮询式等待，避免测试变 flaky）。
+
+    条件里的异常一律当作「还没好」——典型场景是服务还在启动、连接被拒
+    （Linux 上是 ConnectionRefused，Windows 上是另一种错，别让平台差异决定成败）。
+    """
     import time
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if callable(pred) and pred():
-            return True
+        try:
+            if callable(pred) and pred():
+                return True
+        except Exception:  # noqa: BLE001 - 探活阶段的任何异常都算「还没起来」
+            pass
         time.sleep(0.05)
     return False
 
@@ -250,9 +257,9 @@ def test_run_forever_handles_webhook_end_to_end(tmp_path: Path) -> None:
     thread.start()
     try:
         url = f"http://127.0.0.1:{port}/yuque/webhook"
+        # 先把服务等起来（run_forever 里才 bind，早发会 ConnectionRefused）
         assert _wait(
-            lambda: _post(url, {"action_type": "publish", "data": {"id": 1}})[0] in (200, 401),
-            timeout=10,
+            lambda: _post(url, {"action_type": "publish", "data": {"id": 1}})[0] == 200, timeout=15
         )
         assert _wait(lambda: bool(h.notices("accepted")), timeout=10), logs
         # 别的知识库发来的删除事件必须被忽略
