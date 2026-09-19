@@ -519,6 +519,26 @@ uv run yuque classroom serve --repo lqogh0/jsjysq --secret xxx --tidy-toc
 > 归档后，agent 不再处理归档区里的文档（§3 第 3 条）。因为 `state.json` / `applications/`
 > 是本地记录，归档不会丢任何已产出的申请；只是它们不再被重新校验。
 
+#### 目录整理想人工做？完全可以
+
+**agent 完全不依赖目录结构**——周目录叫什么名字、同时有几个、放在根还是子目录，都不影响判定；
+它只认两件跟目录有关的事：
+
+1. **在不在 `归档区` 子树里**：在里面 → 永久跳过（改了也不处理、不告警）；不在 → 照常处理，
+   不管它属于哪一周。所以「上周的目录还来不及拖走」这种状态**没有任何副作用**。
+2. **可选的 `--scope <目录标题>`**：开了才会按目录过滤（默认不开）。
+
+所以人工在语雀里拖拽完全可行，只需注意：
+
+- 别把**还要 agent 处理**的申请拖进 `归档区`（归档 = 冻结）；拖出来就恢复处理，上下文不丢；
+- 别开 `--tidy-toc`（**默认就是关的**），否则 agent 会替你整理（它只碰 TITLE 分组，不碰正文）；
+- 用了 `--scope` 时，别把文档留在 scope 外（会被跳过）；
+- 文档就算被拖出目录（不在 TOC 里）也**照样会被处理**，不会“失踪”。
+
+已经有一组回归用例守着这些行为：`tests/test_classroom_pipeline.py` 里的
+`test_two_active_week_folders_do_not_bother_the_agent` / `test_manual_drag_into_archive_freezes_and_drag_back_resumes`
+/ `test_unmounted_doc_is_still_processed`。
+
 ### 8.7 本地产出也按周分组
 
 ```
@@ -610,7 +630,7 @@ uv run yuque classroom schema --out docs/classroom-application.schema.json
 | 4 | **QQ 身份映射** | 没做（王恩成） | 见 §9 |
 | 5 | **节假日 / 学校封楼** | 没考虑 | `rules.py` 加一张日期黑名单即可 |
 | 6 | **webhook 报文格式** | 语雀没有公开文档，解析器按经验宽容匹配 | 用 `--dump-webhook` 抓真实报文后收紧 `server.parse_webhook` |
-| 7 | **目录整理的部署** | `tidy` 已实现（§8.6），但需要你决定谁来触发：常驻 `--tidy-toc` 还是 cron 周一跑一次 |
+| 7 | **目录整理的部署** | `tidy` 已实现（§8.6）但**默认关**；也可以像以前一样**人工在语雀里拖拽**（见 §8.6「目录整理想人工做」），agent 不受影响 |
 | 8 | **删除检测** | 连续 N 轮（默认 2）看不到才判定 | 若知识库文档量大、`yuque docs` 分页偶发失败，就把 `--delete-grace` 调大 |
 | 9 | **多进程** | 不支持并发写同一 `state.json` | 一个 outdir 一个进程 |
 | 10 | **时区** | 固定 UTC+8（`rules.CN`） | 部署在哪都一样，不用改 |

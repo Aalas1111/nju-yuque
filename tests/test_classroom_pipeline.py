@@ -569,3 +569,52 @@ def test_restored_rejected_doc_is_reviewed_again(tmp_path: Path) -> None:
     h.source.set(make_doc(1, text=body(校区="仙林"), updated_at="2026-09-12T12:00:00+08:00"))
     report = h.run()
     assert report.accepted == ["2026-09-16-7_8-1"]
+
+
+# ---------------------------------------------------------------- 目录结构无关性
+def test_two_active_week_folders_do_not_bother_the_agent(tmp_path: Path) -> None:
+    """两个（甚至更多）活跃目录同时存在 → 判定完全不受影响。
+
+    人工整理目录时（在语雀里拖拽）常见「上周的还没拖进归档区」的状态，
+    agent 不应该因此少处理或多处理任何文档。
+    """
+    items = [
+        toc_title("w1", "0914-0920"),
+        toc_title("w2", "0921-0927"),
+        toc_doc("n1", 1, "压测A", parent="w1"),
+        toc_doc("n2", 2, "压测B", parent="w2"),
+    ]
+    h = build_harness(tmp_path, [make_doc(1, "压测A"), make_doc(2, "压测B")], items=items)
+    report = h.run()
+    assert report.accepted == ["2026-09-16-7_8-1", "2026-09-16-7_8-2"]
+    assert report.rejected == [] and report.skipped == {}
+
+
+def test_unmounted_doc_is_still_processed(tmp_path: Path) -> None:
+    """文档被拖出目录（不在 TOC 里）也照样处理——拖拽不会让申请「失踪」。"""
+    h = build_harness(tmp_path, [make_doc(1, "游离文档")])
+    report = h.run()
+    assert report.accepted == ["2026-09-16-7_8-1"]
+
+
+def test_manual_drag_into_archive_freezes_and_drag_back_resumes(tmp_path: Path) -> None:
+    """人工把目录拖进归档区 = 冻结；再拖出来 = 恢复处理（状态不会丢）。"""
+    week = toc_title("w", "0914-0920")
+    archive = toc_title("arch", "归档区")
+    doc = toc_doc("n1", 1, "压测A", parent="w")
+    h = build_harness(tmp_path, [make_doc(1, "压测A")], items=[week, archive, doc])
+    assert h.run().accepted == ["2026-09-16-7_8-1"]
+    h.box.ack_all()
+
+    # 人工拖进归档区 → 从此不再处理（这里故意改动正文来验证「冻结」）
+    h.source.items = [week, archive, toc_doc("n1", 1, "压测A", parent="arch")]
+    h.source.edit(1, body(活动时间="17:00-19:00"), ts="2026-09-12T10:00:00+08:00")
+    report = h.run()
+    assert dict(report.skipped) == {"已归档": 1}
+    assert h.notices() == []  # 不处理、也不告警
+
+    # 人工再拖回活跃目录 → 恢复处理（已受理是终态，所以这里体现为「改动告警」）
+    h.source.items = [week, archive, toc_doc("n1", 1, "压测A", parent="w")]
+    report = h.run()
+    assert report.tampered == ["压测A"]
+    assert len(h.notices(KIND_TAMPERED)) == 1
