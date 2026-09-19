@@ -270,6 +270,34 @@ class YuqueApi:
         data = self._unwrap(self._request("PUT", f"/api/v2/repos/{repo}/toc", json_body=payload))
         return [TocItem.model_validate(x) for x in (data or [])]
 
+    def toc_place(
+        self,
+        repo: str,
+        *,
+        node_uuid: str,
+        target_uuid: str = "",
+        prepend: bool = False,
+    ) -> list[TocItem]:
+        """把**已有**节点挪到某个父节点的末尾（或不带父节点＝根目录末尾 / 根目录最前）。
+
+        实测（2026-09-19，lqogh0 团队）：
+
+        - ``appendNode`` + ``node_uuid``（不带 ``target_uuid``）→ 移到**根目录最末**；
+        - ``prependNode`` + ``node_uuid``（不带 ``target_uuid``）→ 移到**根目录最前**；
+        - ``appendNode`` + ``node_uuid`` + ``target_uuid`` → 移到该父节点的**子节点最末**；
+        - 按目标顺序依次调用上式，即可排出**任意顺序**（重排归档区靠它）；
+        - ⚠️ ``editNode`` + ``prev_uuid`` 返回 200 但**什么都不做**，不要用。
+        """
+        payload: dict[str, Any] = {
+            "action": "prependNode" if prepend else "appendNode",
+            "action_mode": "child",
+            "node_uuid": node_uuid,
+        }
+        if target_uuid:
+            payload["target_uuid"] = target_uuid
+        data = self._unwrap(self._request("PUT", f"/api/v2/repos/{repo}/toc", json_body=payload))
+        return [TocItem.model_validate(x) for x in (data or [])]
+
     def toc_move(self, repo: str, *, node_uuid: str, target_uuid: str) -> list[TocItem]:
         """把已有目录节点移动到另一个父节点下（归档 / 纠正位置）。
 

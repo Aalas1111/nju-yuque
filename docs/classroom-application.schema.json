@@ -1,0 +1,245 @@
+{
+  "$defs": {
+    "Activity": {
+      "description": "一份申请里「要借什么」的全部要素（CAC 说的「确定要素」）。",
+      "properties": {
+        "name": {
+          "description": "活动名称，直接取文档标题",
+          "title": "Name",
+          "type": "string"
+        },
+        "date": {
+          "description": "借用日期，YYYY-MM-DD",
+          "title": "Date",
+          "type": "string"
+        },
+        "start": {
+          "description": "活动开始时间，HH:MM",
+          "title": "Start",
+          "type": "string"
+        },
+        "end": {
+          "description": "活动结束时间，HH:MM",
+          "title": "End",
+          "type": "string"
+        },
+        "period": {
+          "description": "借用节次，形如 7-8（单节写 7）",
+          "title": "Period",
+          "type": "string"
+        },
+        "period_start": {
+          "description": "起始节次（整数）",
+          "title": "Period Start",
+          "type": "integer"
+        },
+        "period_end": {
+          "description": "结束节次（整数）",
+          "title": "Period End",
+          "type": "integer"
+        },
+        "campus": {
+          "description": "校区规范名：鼓楼 / 浦口 / 仙林 / 苏州",
+          "title": "Campus",
+          "type": "string"
+        },
+        "campus_code": {
+          "description": "学校校区代码：1 鼓楼 / 2 浦口 / 3 仙林 / 4 苏州",
+          "title": "Campus Code",
+          "type": "string"
+        },
+        "building": {
+          "default": "",
+          "description": "教学楼（空 = 不限 / 随机）",
+          "title": "Building",
+          "type": "string"
+        },
+        "room": {
+          "default": "",
+          "description": "意向教室（空 = 随机；不保证借到）",
+          "title": "Room",
+          "type": "string"
+        },
+        "people": {
+          "default": 30,
+          "description": "教室人数需求",
+          "minimum": 0,
+          "title": "People",
+          "type": "integer"
+        },
+        "people_source": {
+          "default": "default",
+          "description": "人数来自文档填写还是默认值",
+          "enum": [
+            "document",
+            "default"
+          ],
+          "title": "People Source",
+          "type": "string"
+        },
+        "borrow_type": {
+          "default": "团学活动",
+          "description": "借用类型（默认团学活动）",
+          "title": "Borrow Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "date",
+        "start",
+        "end",
+        "period",
+        "period_start",
+        "period_end",
+        "campus",
+        "campus_code"
+      ],
+      "title": "Activity",
+      "type": "object"
+    },
+    "SourceRef": {
+      "description": "申请来源：哪一篇语雀文档、谁写的、当时内容指纹。",
+      "properties": {
+        "repo": {
+          "description": "知识库 group/slug",
+          "title": "Repo",
+          "type": "string"
+        },
+        "doc_id": {
+          "description": "语雀文档 id（稳定主键）",
+          "title": "Doc Id",
+          "type": "integer"
+        },
+        "doc_slug": {
+          "default": "",
+          "description": "语雀文档 slug",
+          "title": "Doc Slug",
+          "type": "string"
+        },
+        "doc_url": {
+          "default": "",
+          "description": "文档链接",
+          "title": "Doc Url",
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "description": "文档标题（= 活动名称）",
+          "title": "Title",
+          "type": "string"
+        },
+        "applicant": {
+          "default": "",
+          "description": "申请人字段最终取值（可能是推断出来的）",
+          "title": "Applicant",
+          "type": "string"
+        },
+        "applicant_raw": {
+          "default": "",
+          "description": "文档里原样填写的申请人",
+          "title": "Applicant Raw",
+          "type": "string"
+        },
+        "creator_id": {
+          "default": 0,
+          "description": "文档创建者语雀 user id",
+          "title": "Creator Id",
+          "type": "integer"
+        },
+        "creator_login": {
+          "default": "",
+          "description": "文档创建者语雀 login",
+          "title": "Creator Login",
+          "type": "string"
+        },
+        "creator_name": {
+          "default": "",
+          "description": "文档创建者显示名",
+          "title": "Creator Name",
+          "type": "string"
+        },
+        "content_hash": {
+          "default": "",
+          "description": "正文指纹 sha256:...，用于判定「文档被改过」",
+          "title": "Content Hash",
+          "type": "string"
+        },
+        "doc_updated_at": {
+          "default": "",
+          "description": "语雀侧 updated_at",
+          "title": "Doc Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo",
+        "doc_id"
+      ],
+      "title": "SourceRef",
+      "type": "object"
+    }
+  },
+  "description": "一份要素齐备的借用申请（交接给「发起借用」模块）。",
+  "properties": {
+    "schema_version": {
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "application_type": {
+      "default": "classroom_borrow",
+      "title": "Application Type",
+      "type": "string"
+    },
+    "application_id": {
+      "description": "稳定 id：<date>-<period>-<doc_id>",
+      "title": "Application Id",
+      "type": "string"
+    },
+    "packaged_at": {
+      "description": "打包时间（UTC+8，ISO8601）",
+      "title": "Packaged At",
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/$defs/SourceRef"
+    },
+    "activity": {
+      "$ref": "#/$defs/Activity"
+    },
+    "raw_fields": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "文档里原样填写的字段",
+      "title": "Raw Fields",
+      "type": "object"
+    },
+    "normalizations": {
+      "description": "agent 做过的自动规范化（人工可复核）",
+      "items": {
+        "type": "string"
+      },
+      "title": "Normalizations",
+      "type": "array"
+    },
+    "warnings": {
+      "description": "可疑但放行的提示（如时间过长、12 小时制歧义）",
+      "items": {
+        "type": "string"
+      },
+      "title": "Warnings",
+      "type": "array"
+    }
+  },
+  "required": [
+    "application_id",
+    "packaged_at",
+    "source",
+    "activity"
+  ],
+  "title": "教室借用申请（Application）",
+  "type": "object",
+  "$id": "https://github.com/Aalas1111/NJU_Yuque/classroom-application/1.0"
+}

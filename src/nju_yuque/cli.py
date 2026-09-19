@@ -21,6 +21,7 @@ from rich.table import Table
 from . import __version__, auth, lakesheet
 from . import config as config_mod
 from .api import YuqueApi
+from .classroom import cli as classroom_cli
 from .errors import InsufficientScopeError, NotLoggedInError, WrongModeError, YuqueError
 from .models import Doc, Member, Repo, as_dict
 from .session import Credentials, scope_allows_write
@@ -50,6 +51,7 @@ app.add_typer(skill_app, name="skill")
 app.add_typer(doc_app, name="doc")
 app.add_typer(toc_app, name="toc")
 app.add_typer(repo_app, name="repo")
+app.add_typer(classroom_cli.new_app(), name="classroom")
 
 # rich 在 Windows 的 legacy console 下会直接调 Win32 API，管道被关闭时（如 `| head`）
 # 会抛 OSError(22)；关掉 legacy 渲染后走普通流写入，BrokenPipe 可被 rich 正常处理。

@@ -19,6 +19,11 @@ yuque-state.json
 .env.*
 !.env.example
 
+# ---- 教室申请 agent 的本地产出（不要入库）----
+outbox/
+webhook-raw/
+classroom-out/
+
 # ---- Playwright ----
 .playwright-cli/
 *.playwright-profile/
